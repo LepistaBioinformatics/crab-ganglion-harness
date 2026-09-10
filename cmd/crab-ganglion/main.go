@@ -30,6 +30,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/loadimage"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -231,7 +232,11 @@ func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) 
 // should not silently lose it -- a container recreate is the honest way to
 // change the tool set, and the proxy already recreates on a bind change.
 func tools(workspace, self string, reg config.Registry, logger *log.Logger) []tool.Tool {
-	out := []tool.Tool{shellTool(workspace, self)}
+	// load_image is unconditional: an image in the workspace is something any
+	// deployment can have, and the tool costs nothing when none is there. What
+	// varies is whether a model can SEE the result, which the vision chain
+	// decides at completion time rather than here.
+	out := []tool.Tool{shellTool(workspace, self), loadimage.New(workspace)}
 	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
 		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))
 		logger.Printf("tools: web_search and web_fetch enabled")

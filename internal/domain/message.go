@@ -97,6 +97,11 @@ type Result struct {
 	// Denied marks a result produced by the approval path rather than by running
 	// the tool.
 	Denied bool
+	// Attachments are media the tool produced for the MODEL to look at, not for
+	// the member. A tool result cannot carry them itself -- most providers
+	// reject image parts on a `tool` role message -- so the loop turns them into
+	// a synthetic user message after the result. See Loop.runTool.
+	Attachments []Attachment
 }
 
 // Usage is the token accounting for one provider call (FR-8). It is the whole

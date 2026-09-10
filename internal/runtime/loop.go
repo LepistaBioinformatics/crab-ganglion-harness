@@ -201,6 +201,23 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			// The tool result goes to the window only. The served transcript
 			// records what the member saw, and they never saw this.
 			window.Messages = append(window.Messages, out)
+
+			// Media a tool produced follows as a SYNTHETIC USER MESSAGE rather
+			// than riding on the result above.
+			//
+			// Not a stylistic choice: most providers reject image parts on a
+			// `tool` role message, and the ones that accept them disagree about
+			// the shape. A user message carrying the image is the one form every
+			// OpenAI-compatible endpoint understands, and it is what picoclaw
+			// does too (agent_media.go, toolImageFollowUpPromptMessage).
+			if len(res.Attachments) > 0 {
+				window.Messages = append(window.Messages, domain.Message{
+					Role:        domain.RoleUser,
+					Content:     "Here is the media that tool loaded.",
+					Attachments: res.Attachments,
+					CreatedAt:   c.Now(),
+				})
+			}
 		}
 
 		window = compact(window, c.WindowBudget)
