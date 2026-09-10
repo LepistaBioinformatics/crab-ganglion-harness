@@ -207,3 +207,67 @@ func TestAListWithNoDeclaredDefaultUsesTheFirstEntry(t *testing.T) {
 		t.Fatalf("default = %q, want only", reg.Default)
 	}
 }
+
+// tools.web is picoclaw's block, read from picoclaw's own keys. This is the
+// example from its documentation, verbatim.
+func TestTheWebToolBlockIsReadFromPicoclawsKeys(t *testing.T) {
+	reg := load(t, write(t, `{
+      "model_list":[{"model_name":"m","model":"x","api_base":"https://e/v1"}],
+      "tools": {
+        "web": {
+          "provider": "auto",
+          "fetch_limit_bytes": 2000000,
+          "brave":      {"enabled": true, "max_results": 5, "api_keys": ["bsa-key"]},
+          "tavily":     {"enabled": true},
+          "searxng":    {"enabled": true, "base_url": "https://searx.example/"},
+          "duckduckgo": {"enabled": true, "max_results": 5},
+          "kagi":       {"enabled": true}
+        }
+      }}`), nil)
+
+	if !reg.Web.Enabled() {
+		t.Fatal("the web tool block should be enabled")
+	}
+	if reg.Web.FetchLimitBytes != 2000000 {
+		t.Errorf("fetch_limit_bytes = %d", reg.Web.FetchLimitBytes)
+	}
+	b, ok := reg.Web.Find("brave")
+	if !ok || b.APIKey != "bsa-key" || b.MaxResults != 5 {
+		t.Errorf("brave decoded wrong: %+v", b)
+	}
+	if s, _ := reg.Web.Find("searxng"); s.BaseURL != "https://searx.example/" {
+		t.Errorf("searxng base_url = %q", s.BaseURL)
+	}
+	// kagi is picoclaw's and not implemented here. It must be IGNORED, not an
+	// error: a shared config file will name providers each harness does not
+	// have, and rejecting the file over one of them would break both.
+	if _, ok := reg.Web.Find("kagi"); ok {
+		t.Error("an unimplemented provider was adopted")
+	}
+}
+
+// Unlike a model entry, a provider block that says nothing is NOT enabled.
+// `"brave": {}` is how picoclaw's examples leave a provider present and off,
+// and turning on every provider merely mentioned would enable one an operator
+// only meant to key.
+func TestAWebProviderMustSayEnabled(t *testing.T) {
+	reg := load(t, write(t, `{"tools":{"web":{"brave":{"api_keys":["k"]}}}}`), nil)
+	if reg.Web.Enabled() {
+		t.Fatal("a provider block with no `enabled` must not be enabled")
+	}
+}
+
+func TestAWebProviderKeyComesFromTheEnvironmentFirst(t *testing.T) {
+	reg := load(t, write(t, `{"tools":{"web":{"brave":{"enabled":true,"api_keys":["from-the-file"]}}}}`),
+		map[string]string{"GANGLION_WEB_KEY_BRAVE": "from-the-environment"})
+	if b, _ := reg.Web.Find("brave"); b.APIKey != "from-the-environment" {
+		t.Fatalf("APIKey = %q", b.APIKey)
+	}
+}
+
+func TestAnAbsentWebBlockIsNotAnError(t *testing.T) {
+	reg := load(t, write(t, `{"model_list":[{"model_name":"m","model":"x","api_base":"https://e/v1"}]}`), nil)
+	if reg.Web.Enabled() {
+		t.Fatal("no tools.web block must mean no search tool")
+	}
+}

@@ -29,6 +29,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/runtime"
@@ -110,7 +111,7 @@ func main() {
 		// only ever sees the narrow interface for each job.
 		Checkpoints:     transcript,
 		Context:         window.New(filepath.Join(workspace, "windows")),
-		Tools:           tool.NewRegistry(shellTool(workspace, self)),
+		Tools:           tool.NewRegistry(tools(workspace, self, reg, logger)...),
 		Model:           cfg.Model,
 		System:          systemPrompt(cfg, logger),
 		MaxIterations:   cfg.MaxTurnIter,
@@ -215,6 +216,26 @@ func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) 
 		return c
 	}
 	return router.New(reg, path, build, load, logger.Printf), nil
+}
+
+// tools assembles the tool set.
+//
+// A tool that cannot work is ABSENT rather than present-and-explaining-itself.
+// Telling the model about web_search and then answering "not configured" costs
+// a whole turn to discover something the boot already knew.
+//
+// The set is fixed at boot even though the model registry reloads. Adding or
+// removing a tool changes what the model was told it could do partway through a
+// conversation, and a conversation that has already been offered a capability
+// should not silently lose it -- a container recreate is the honest way to
+// change the tool set, and the proxy already recreates on a bind change.
+func tools(workspace, self string, reg config.Registry, logger *log.Logger) []tool.Tool {
+	out := []tool.Tool{shellTool(workspace, self)}
+	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
+		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))
+		logger.Printf("tools: web_search and web_fetch enabled")
+	}
+	return out
 }
 
 func systemPrompt(cfg config.Config, logger *log.Logger) string {

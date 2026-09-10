@@ -115,16 +115,82 @@ type file struct {
 			ModelFallbacks []string `json:"model_fallbacks"`
 		} `json:"defaults"`
 	} `json:"agents"`
+
+	Tools struct {
+		// Web is decoded twice: once for the settings that are the same for
+		// every provider, and once as a raw map so a provider block can be
+		// read by name without this struct having to enumerate them. Adding a
+		// provider is then a file in the websearch adapter, not an edit here.
+		Web json.RawMessage `json:"web"`
+	} `json:"tools"`
 }
 
-// Registry is the resolved model configuration: an ordered list plus the
-// default chain. It is what the composition root turns into providers.
+// webBlock is the shape shared by every provider under tools.web, plus the
+// settings that sit beside them.
+type webBlock struct {
+	Provider        string `json:"provider"`
+	Proxy           string `json:"proxy"`
+	FetchLimitBytes int64  `json:"fetch_limit_bytes"`
+}
+
+// WebProvider is one search provider's configuration. Keys are picoclaw's
+// (pkg/config/config.go:868-1001) so one record materializes for both
+// harnesses.
+type WebProvider struct {
+	Name       string
+	Enabled    bool
+	APIKey     string
+	BaseURL    string
+	MaxResults int
+}
+
+// Web is the whole tools.web block.
+type Web struct {
+	// Provider names the one to use. Empty or "auto" walks the priority order.
+	Provider        string
+	Proxy           string
+	FetchLimitBytes int64
+	Providers       []WebProvider
+}
+
+// Enabled reports whether the search tool should exist at all. A tool the model
+// is told about and that can never answer is worse than no tool: it spends a
+// turn discovering the absence.
+func (w Web) Enabled() bool {
+	for _, p := range w.Providers {
+		if p.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// Find returns one provider's configuration.
+func (w Web) Find(name string) (WebProvider, bool) {
+	for _, p := range w.Providers {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return WebProvider{}, false
+}
+
+// WebKeyEnvVar is the environment variable carrying one provider's key. Same
+// contract as KeyEnvVar: crab-shell-proxy derives the same name.
+func WebKeyEnvVar(provider string) string {
+	return "GANGLION_WEB_KEY_" + strings.ToUpper(strings.ReplaceAll(provider, "-", "_"))
+}
+
+// Registry is the resolved configuration read from the file: the model list
+// and default chain, plus the tool blocks that sit beside them.
 type Registry struct {
 	Models []ModelSpec
 	// Default names the entry a turn runs on when it asks for nothing.
 	Default string
 	// DefaultFallbacks follow Default, before that entry's own Fallbacks.
 	DefaultFallbacks []string
+	// Web is tools.web.
+	Web Web
 }
 
 // Find returns the spec for a model_name.
@@ -224,7 +290,7 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 		if spec.Model == "" {
 			spec.Model = e.ModelName
 		}
-		key, err := resolveKey(e.APIKeys, spec.Name, res, keyEnv)
+		key, err := resolveKey(e.APIKeys, spec.Name, res, keyEnv, KeyEnvVar)
 		if err != nil {
 			return Registry{}, fmt.Errorf("model %q: %w", spec.Name, err)
 		}
@@ -236,7 +302,81 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 	if reg.Default == "" && len(reg.Models) > 0 {
 		reg.Default = reg.Models[0].Name
 	}
+
+	web, err := loadWeb(f.Tools.Web, res, keyEnv)
+	if err != nil {
+		return Registry{}, err
+	}
+	reg.Web = web
 	return reg, nil
+}
+
+// WebProviderNames is the set of providers this harness implements, in the
+// order they are preferred when tools.web.provider is unset.
+//
+// picoclaw's own order, restricted to the implemented set: the keyed providers
+// first, then the self-hosted one, then the one that needs no credential at all
+// and therefore always works. Declared HERE rather than in the adapter because
+// this is also the order the loader reads the config in, and two orders that
+// have to agree are one order too many.
+var WebProviderNames = []string{"brave", "tavily", "searxng", "duckduckgo"}
+
+// loadWeb decodes tools.web. An absent block yields a Web with no enabled
+// provider, which is what makes the tool absent rather than useless.
+func loadWeb(raw json.RawMessage, res secret.Resolver, keyEnv func(string) string) (Web, error) {
+	if len(raw) == 0 {
+		return Web{}, nil
+	}
+	var head webBlock
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return Web{}, fmt.Errorf("parse tools.web: %w", err)
+	}
+	// Decoded to raw messages FIRST, then one provider at a time.
+	//
+	// tools.web mixes scalars (provider, proxy, fetch_limit_bytes) with objects
+	// (one per provider) in the same object. A single decode into
+	// map[string]<providerStruct> therefore fails on the scalars and silently
+	// yields no providers -- which is how the whole block reads as "search is
+	// off" while looking perfectly correct in the file.
+	var byName map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &byName); err != nil {
+		return Web{}, fmt.Errorf("parse tools.web: %w", err)
+	}
+
+	w := Web{Provider: head.Provider, Proxy: head.Proxy, FetchLimitBytes: head.FetchLimitBytes}
+	for _, name := range WebProviderNames {
+		blob, ok := byName[name]
+		if !ok {
+			continue
+		}
+		var e struct {
+			Enabled    *bool    `json:"enabled"`
+			APIKey     string   `json:"api_key"`
+			APIKeys    []string `json:"api_keys"`
+			BaseURL    string   `json:"base_url"`
+			MaxResults int      `json:"max_results"`
+		}
+		if err := json.Unmarshal(blob, &e); err != nil {
+			return Web{}, fmt.Errorf("parse tools.web.%s: %w", name, err)
+		}
+		p := WebProvider{
+			Name: name,
+			// Unlike a model entry, a provider block that says nothing is NOT
+			// enabled. Declaring `"brave": {}` is how picoclaw's own examples
+			// leave a provider present and off, and turning every mentioned
+			// provider on would enable one the operator only meant to key.
+			Enabled:    e.Enabled != nil && *e.Enabled,
+			BaseURL:    e.BaseURL,
+			MaxResults: e.MaxResults,
+		}
+		key, err := resolveKey(append([]string{e.APIKey}, e.APIKeys...), name, res, keyEnv, WebKeyEnvVar)
+		if err != nil {
+			return Web{}, fmt.Errorf("tools.web.%s: %w", name, err)
+		}
+		p.APIKey = key
+		w.Providers = append(w.Providers, p)
+	}
+	return w, nil
 }
 
 // resolveKey applies FR-4's order: the environment first, the file second.
@@ -244,9 +384,9 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 // The environment wins because that is the path the proxy uses, and because a
 // key that never enters a file cannot be read by anything that gets pointed at
 // the file by mistake.
-func resolveKey(inline []string, name string, res secret.Resolver, keyEnv func(string) string) (string, error) {
+func resolveKey(inline []string, name string, res secret.Resolver, keyEnv func(string) string, namer func(string) string) (string, error) {
 	if keyEnv != nil {
-		if v := keyEnv(KeyEnvVar(name)); v != "" {
+		if v := keyEnv(namer(name)); v != "" {
 			return res.Resolve(v)
 		}
 	}
