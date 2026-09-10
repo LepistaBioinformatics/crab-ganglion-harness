@@ -23,8 +23,25 @@ type Provider interface {
 // knowing that a file exists. The loop asks once per turn and then owns the
 // order; deciding WHEN to move down it is the loop's, not the chain's.
 type ModelChain interface {
-	Chain(turnModel string) []string
+	// Chain returns the candidates for one turn, for one KIND of work.
+	//
+	// The kind is a parameter rather than three methods because the caller's
+	// question is always the same -- "what may I use for this" -- and the
+	// difference is which slot answers it.
+	Chain(turnModel string, kind ModelKind) []string
 }
+
+// ModelKind is what a completion is FOR.
+type ModelKind string
+
+const (
+	// ModelText is ordinary conversation.
+	ModelText ModelKind = "text"
+	// ModelVision reads images.
+	ModelVision ModelKind = "vision"
+	// ModelImageGen produces them.
+	ModelImageGen ModelKind = "image"
+)
 
 // Stream yields deltas as they arrive.
 //

@@ -8,6 +8,7 @@ package httpsse
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,7 +104,11 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		SessionID:  domain.ConversationID(req.sessionID(r)),
 		SessionKey: domain.SessionKey(req.sessionKey(r)),
 		Model:      req.Model,
-		Input:      domain.Message{Role: domain.RoleUser, Content: last},
+		Input: domain.Message{
+			Role:        domain.RoleUser,
+			Content:     last,
+			Attachments: req.attachments(),
+		},
 	}
 
 	if _, err := s.handler(r.Context(), turn, sw.sink()); err != nil {
@@ -134,8 +139,57 @@ type request struct {
 	Messages []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
+		// Attachments carry images the member sent with this message.
+		//
+		// A field of our own rather than OpenAI's multi-part `content` array:
+		// crab-shell-proxy is the only caller, the array form would make
+		// `content` a union this parser has to disambiguate on every request,
+		// and the harness's own wire adapter builds that array anyway when it
+		// talks to a provider. Compatibility with picoclaw's INPUT shape was
+		// never a requirement -- nothing but the proxy speaks to either.
+		Attachments []struct {
+			Kind string `json:"kind"`
+			MIME string `json:"mime"`
+			Name string `json:"name,omitempty"`
+			// Data is standard base64. Sent inline because the proxy already
+			// holds the bytes and a URL would have to be reachable from inside
+			// the agent network, which is the one place they must not be.
+			Data string `json:"data"`
+		} `json:"attachments,omitempty"`
 	} `json:"messages"`
 	SessionID string `json:"session_id"`
+}
+
+// attachments decodes the media on the last user message.
+//
+// Only the last one: earlier messages in the request are history the harness
+// already holds in its own window, and re-decoding a conversation's worth of
+// base64 on every turn would grow the cost of a turn with the age of the
+// conversation.
+//
+// A malformed attachment is DROPPED rather than failing the turn. The member
+// sent a message; answering it without the image beats refusing it, and the
+// degradation path already exists for the case where nothing can read one.
+func (r request) attachments() []domain.Attachment {
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if r.Messages[i].Role != string(domain.RoleUser) {
+			continue
+		}
+		var out []domain.Attachment
+		for _, a := range r.Messages[i].Attachments {
+			data, err := base64.StdEncoding.DecodeString(a.Data)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			kind := domain.AttachmentKind(a.Kind)
+			if kind == "" {
+				kind = domain.AttachmentImage
+			}
+			out = append(out, domain.Attachment{Kind: kind, MIME: a.MIME, Name: a.Name, Data: data})
+		}
+		return out
+	}
+	return nil
 }
 
 func (r request) lastUserMessage() (string, bool) {

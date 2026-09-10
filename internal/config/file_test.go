@@ -111,7 +111,7 @@ func TestAnAbsentEnabledMeansEnabled(t *testing.T) {
 	if m, _ := reg.Find("off"); m.Enabled {
 		t.Error("`enabled: false` must disable")
 	}
-	if got := reg.Chain(""); !reflect.DeepEqual(got, []string{"on"}) {
+	if got := reg.Chain("", KindText); !reflect.DeepEqual(got, []string{"on"}) {
 		t.Errorf("chain = %v, want [on] -- a disabled model must not be a candidate", got)
 	}
 }
@@ -159,7 +159,7 @@ func TestTheChainIsDefaultThenItsFallbacks(t *testing.T) {
         {"model_name":"b","model":"x","api_base":"https://e/v1"},
         {"model_name":"c","model":"x","api_base":"https://e/v1"}],
       "agents":{"defaults":{"model_name":"a","model_fallbacks":["b"]}}}`), nil)
-	if got := reg.Chain(""); !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+	if got := reg.Chain("", KindText); !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
 		t.Fatalf("chain = %v, want [a b c]", got)
 	}
 }
@@ -171,7 +171,7 @@ func TestAnUnknownTurnModelFallsBackToTheDefaultChain(t *testing.T) {
 	reg := load(t, write(t, `{
       "model_list":[{"model_name":"a","model":"x","api_base":"https://e/v1"}],
       "agents":{"defaults":{"model_name":"a"}}}`), nil)
-	if got := reg.Chain("picoclaw"); !reflect.DeepEqual(got, []string{"a"}) {
+	if got := reg.Chain("picoclaw", KindText); !reflect.DeepEqual(got, []string{"a"}) {
 		t.Fatalf("chain = %v, want [a] for the proxy's placeholder", got)
 	}
 }
@@ -182,7 +182,7 @@ func TestAKnownTurnModelIsHonoured(t *testing.T) {
         {"model_name":"a","model":"x","api_base":"https://e/v1"},
         {"model_name":"b","model":"y","api_base":"https://e/v1"}],
       "agents":{"defaults":{"model_name":"a"}}}`), nil)
-	if got := reg.Chain("b"); !reflect.DeepEqual(got, []string{"b"}) {
+	if got := reg.Chain("b", KindText); !reflect.DeepEqual(got, []string{"b"}) {
 		t.Fatalf("chain = %v, want [b]", got)
 	}
 }
@@ -194,7 +194,7 @@ func TestAFallbackCycleTerminates(t *testing.T) {
         {"model_name":"a","model":"x","api_base":"https://e/v1","fallbacks":["b"]},
         {"model_name":"b","model":"x","api_base":"https://e/v1","fallbacks":["a"]}],
       "agents":{"defaults":{"model_name":"a"}}}`), nil)
-	if got := reg.Chain(""); !reflect.DeepEqual(got, []string{"a", "b"}) {
+	if got := reg.Chain("", KindText); !reflect.DeepEqual(got, []string{"a", "b"}) {
 		t.Fatalf("chain = %v, want [a b] with no repetition", got)
 	}
 }
@@ -269,5 +269,49 @@ func TestAnAbsentWebBlockIsNotAnError(t *testing.T) {
 	reg := load(t, write(t, `{"model_list":[{"model_name":"m","model":"x","api_base":"https://e/v1"}]}`), nil)
 	if reg.Web.Enabled() {
 		t.Fatal("no tools.web block must mean no search tool")
+	}
+}
+
+// A deployment whose only model is multimodal must not have to declare a second
+// entry saying so: with no image_model, the ordinary chain answers an image
+// turn, and if that model cannot see, the loop's degradation is what the member
+// meets -- not a refusal here.
+func TestWithNoImageModelTheVisionChainIsTheTextChain(t *testing.T) {
+	reg := load(t, write(t, `{
+      "model_list":[{"model_name":"a","model":"x","api_base":"https://e/v1"}],
+      "agents":{"defaults":{"model_name":"a"}}}`), nil)
+	if got := reg.Chain("", KindVision); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("vision chain = %v, want the text chain [a]", got)
+	}
+}
+
+// picoclaw's own keys, so a config written for it routes images here too.
+func TestTheVisionChainReadsPicoclawsImageModelKeys(t *testing.T) {
+	reg := load(t, write(t, `{
+      "model_list":[
+        {"model_name":"chat","model":"x","api_base":"https://e/v1"},
+        {"model_name":"eyes","model":"y","api_base":"https://e/v1"},
+        {"model_name":"spare-eyes","model":"z","api_base":"https://e/v1"}],
+      "agents":{"defaults":{
+        "model_name":"chat",
+        "image_model":"eyes",
+        "image_model_fallbacks":["spare-eyes"]}}}`), nil)
+	if got := reg.Chain("", KindVision); !reflect.DeepEqual(got, []string{"eyes", "spare-eyes"}) {
+		t.Fatalf("vision chain = %v, want [eyes spare-eyes]", got)
+	}
+	if got := reg.Chain("", KindText); !reflect.DeepEqual(got, []string{"chat"}) {
+		t.Fatalf("text chain = %v, want [chat]", got)
+	}
+}
+
+// Generation does NOT fall back to a text model. A text model asked to produce
+// an image returns prose describing one, which is worse than an absent tool
+// because it looks like success.
+func TestTheGenerationChainDoesNotFallBackToATextModel(t *testing.T) {
+	reg := load(t, write(t, `{
+      "model_list":[{"model_name":"chat","model":"x","api_base":"https://e/v1"}],
+      "agents":{"defaults":{"model_name":"chat"}}}`), nil)
+	if got := reg.Chain("", KindImageGen); len(got) != 0 {
+		t.Fatalf("generation chain = %v, want empty so the tool is absent", got)
 	}
 }

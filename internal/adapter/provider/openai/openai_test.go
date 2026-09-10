@@ -254,3 +254,94 @@ func TestWithoutExtraBodyTheRequestIsUnchanged(t *testing.T) {
 		t.Error("extra_body leaked into the request as a key of its own")
 	}
 }
+
+// AC-3 of multimodal-with-fallback, and the reason wireMessage.Content is
+// `any`: a text-only turn must keep sending the STRING form. Some providers
+// reject the array form outright, others bill it differently, and every one of
+// them has been tested against the string form for years.
+func TestATextOnlyTurnStillSendsAPlainStringContent(t *testing.T) {
+	got := captureCompletion(t, domain.Completion{
+		Model:    "m",
+		Messages: []domain.Message{{Role: domain.RoleUser, Content: "hello"}},
+	})
+	msgs := got.body["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	if _, isString := last["content"].(string); !isString {
+		t.Fatalf("content was not a plain string: %#v", last["content"])
+	}
+}
+
+// And a turn WITH an image sends the array form, with the bytes inline as a
+// data: URL -- never a link, which would have to be reachable BY THE PROVIDER
+// and would mean publishing a member's image to show it to a model.
+func TestAnImageTurnSendsTypedPartsWithInlineBytes(t *testing.T) {
+	got := captureCompletion(t, domain.Completion{
+		Model: "m",
+		Messages: []domain.Message{{
+			Role:    domain.RoleUser,
+			Content: "what is this?",
+			Attachments: []domain.Attachment{
+				{Kind: domain.AttachmentImage, MIME: "image/png", Data: []byte{1, 2, 3}},
+			},
+		}},
+	})
+	msgs := got.body["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	parts, isArray := last["content"].([]any)
+	if !isArray {
+		t.Fatalf("content was not an array: %#v", last["content"])
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected a text part and an image part, got %d", len(parts))
+	}
+	if parts[0].(map[string]any)["type"] != "text" {
+		t.Errorf("the first part is not the text: %#v", parts[0])
+	}
+	img := parts[1].(map[string]any)
+	if img["type"] != "image_url" {
+		t.Fatalf("the second part is not an image: %#v", img)
+	}
+	url := img["image_url"].(map[string]any)["url"].(string)
+	if !strings.HasPrefix(url, "data:image/png;base64,") {
+		t.Errorf("the image did not travel inline as a data URL: %s", url)
+	}
+	if strings.Contains(url, "http") {
+		t.Errorf("the image travelled as a link: %s", url)
+	}
+}
+
+// An attachment with no MIME must still be sent as something a provider
+// accepts, rather than as `data:;base64,` which every one of them rejects.
+func TestAnAttachmentWithNoMIMEGetsADefault(t *testing.T) {
+	got := captureCompletion(t, domain.Completion{
+		Model: "m",
+		Messages: []domain.Message{{
+			Role:        domain.RoleUser,
+			Attachments: []domain.Attachment{{Kind: domain.AttachmentImage, Data: []byte{1}}},
+		}},
+	})
+	msgs := got.body["messages"].([]any)
+	parts := msgs[len(msgs)-1].(map[string]any)["content"].([]any)
+	url := parts[0].(map[string]any)["image_url"].(map[string]any)["url"].(string)
+	if !strings.HasPrefix(url, "data:image/") {
+		t.Fatalf("no MIME default was applied: %s", url)
+	}
+}
+
+func captureCompletion(t *testing.T, req domain.Completion) captured {
+	t.Helper()
+	var got captured
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.headers = r.Header.Clone()
+		_ = json.NewDecoder(r.Body).Decode(&got.body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+	s, err := New(srv.URL, "k", srv.Client()).Complete(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	return got
+}

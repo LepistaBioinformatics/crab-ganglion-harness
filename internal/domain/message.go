@@ -29,6 +29,34 @@ const (
 // deliberate: crab-shell-proxy's internal/history already parses that shape, so
 // a reader for ganglion transcripts is a path change rather than a new format.
 // Go-style field names on disk would have made compatibility a rewrite.
+// AttachmentKind is what a piece of non-text content IS.
+//
+// An enum rather than a MIME check because the ROUTING decision is coarse --
+// "does this turn need a model that can see" -- while the MIME type is what the
+// provider needs on the wire. Audio and video are not routed in v1; they are
+// additive here rather than a new field later.
+type AttachmentKind string
+
+const (
+	AttachmentImage AttachmentKind = "image"
+)
+
+// Attachment is non-text content carried by a message.
+//
+// Data is the bytes, not a path or a reference. The harness holds one turn's
+// content in memory for the length of that turn anyway, and a reference would
+// need a store, a lifetime and a cleanup policy -- picoclaw has all three
+// (pkg/media) and they exist to serve channels this harness does not have.
+type Attachment struct {
+	Kind AttachmentKind `json:"kind"`
+	// MIME is what goes on the wire. A provider rejects an image whose type it
+	// was told wrongly, so this is not cosmetic.
+	MIME string `json:"mime"`
+	// Name is for the member and for the transcript, never for the provider.
+	Name string `json:"name,omitempty"`
+	Data []byte `json:"data,omitempty"`
+}
+
 type Message struct {
 	Role    Role   `json:"role"`
 	Content string `json:"content"`
@@ -37,7 +65,11 @@ type Message struct {
 	// history reader makes the same split.
 	Reasoning string `json:"reasoning_content,omitempty"`
 	// ToolCalls is set on an assistant message that asked for tools.
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// Attachments are images (and, later, other media) the member sent with
+	// this message. Empty on almost every message, which is why the wire
+	// adapter must keep emitting the plain string form when it is.
+	Attachments []Attachment
+	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID links a RoleTool message back to the call it answers.
 	ToolCallID string    `json:"tool_call_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`

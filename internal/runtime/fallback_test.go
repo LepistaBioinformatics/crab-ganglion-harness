@@ -13,7 +13,7 @@ import (
 // chain is a fixed ModelChain.
 type chain []string
 
-func (c chain) Chain(string) []string { return []string(c) }
+func (c chain) Chain(string, domain.ModelKind) []string { return []string(c) }
 
 // scripted answers per MODEL rather than per call, which is what a fallback
 // test needs: the assertion is "the second model was asked", not "the provider
@@ -27,10 +27,15 @@ type scripted struct {
 	streamFail map[string]error
 	deltas     map[string][]string
 	content    map[string]string
+	// observe sees every completion before it is answered.
+	observe func(domain.Completion)
 }
 
 func (s *scripted) Complete(_ context.Context, c domain.Completion) (domain.Stream, error) {
 	s.asked = append(s.asked, c.Model)
+	if s.observe != nil {
+		s.observe(c)
+	}
 	if err := s.fail[c.Model]; err != nil {
 		return nil, err
 	}

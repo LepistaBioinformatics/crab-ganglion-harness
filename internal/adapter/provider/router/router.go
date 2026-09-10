@@ -92,11 +92,11 @@ func (r *Router) stamp() {
 // once per turn, at its start, and never mid-turn -- so a turn runs against one
 // coherent registry from beginning to end even if an admin saves twice while it
 // is streaming.
-func (r *Router) Chain(turnModel string) []string {
+func (r *Router) Chain(turnModel string, kind domain.ModelKind) []string {
 	r.refresh()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.reg.Chain(turnModel)
+	return r.reg.Chain(turnModel, config.Kind(kind))
 }
 
 // refresh re-reads the file if mtime or size moved.

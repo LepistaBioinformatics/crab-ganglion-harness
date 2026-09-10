@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -256,11 +257,65 @@ type toolCallDelta struct {
 	} `json:"function"`
 }
 
+// wireMessage's Content is `any` for one reason, and it is the whole of this
+// format's multimodal support: OpenAI accepts EITHER a plain string OR an array
+// of typed parts, and the two are not interchangeable.
+//
+// A text-only turn must keep sending the string. Some providers reject the
+// array form outright, others bill it differently, and every one of them has
+// been tested against the string form for years -- so "always send parts" would
+// change the bytes of every request this harness has ever made in order to
+// serve the small fraction that carry an image.
 type wireMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []wireCall `json:"tool_calls,omitempty"`
+}
+
+// contentPart is one element of the array form.
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+// contentFor returns the string form for an ordinary message and the array form
+// for one carrying attachments.
+//
+// Images travel as data: URLs rather than as links. A link would have to be
+// reachable BY THE PROVIDER, which means publishing the member's image on the
+// open internet to show it to a model -- the exact thing a per-tenant isolated
+// workspace exists to prevent.
+func contentFor(m domain.Message) any {
+	if len(m.Attachments) == 0 {
+		return m.Content
+	}
+	parts := make([]contentPart, 0, len(m.Attachments)+1)
+	if m.Content != "" {
+		parts = append(parts, contentPart{Type: "text", Text: m.Content})
+	}
+	for _, a := range m.Attachments {
+		if a.Kind != domain.AttachmentImage || len(a.Data) == 0 {
+			continue
+		}
+		mime := a.MIME
+		if mime == "" {
+			mime = "image/png"
+		}
+		parts = append(parts, contentPart{
+			Type:     "image_url",
+			ImageURL: &imageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(a.Data)},
+		})
+	}
+	if len(parts) == 0 {
+		return m.Content
+	}
+	return parts
 }
 
 type wireCall struct {
@@ -309,7 +364,7 @@ func buildRequest(req domain.Completion) wireRequest {
 		out.Messages = append(out.Messages, wireMessage{Role: string(domain.RoleSystem), Content: req.Window.Summary})
 	}
 	for _, m := range req.Messages {
-		wm := wireMessage{Role: string(m.Role), Content: m.Content, ToolCallID: m.ToolCallID}
+		wm := wireMessage{Role: string(m.Role), Content: contentFor(m), ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
 			var c wireCall
 			c.ID = tc.ID

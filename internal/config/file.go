@@ -113,6 +113,16 @@ type file struct {
 		Defaults struct {
 			ModelName      string   `json:"model_name"`
 			ModelFallbacks []string `json:"model_fallbacks"`
+			// image_model and image_model_fallbacks are picoclaw's own keys
+			// (pkg/config/config.go:430-431) for the model that READS images.
+			ImageModel          string   `json:"image_model"`
+			ImageModelFallbacks []string `json:"image_model_fallbacks"`
+			// image_gen_model has no picoclaw equivalent -- picoclaw cannot
+			// generate images at all -- and is named to sit beside the pair
+			// above so a future picoclaw that grows the feature has an obvious
+			// place to land.
+			ImageGenModel          string   `json:"image_gen_model"`
+			ImageGenModelFallbacks []string `json:"image_gen_model_fallbacks"`
 		} `json:"defaults"`
 	} `json:"agents"`
 
@@ -189,9 +199,33 @@ type Registry struct {
 	Default string
 	// DefaultFallbacks follow Default, before that entry's own Fallbacks.
 	DefaultFallbacks []string
+	// Vision is the chain for a turn carrying an image. Empty means there is
+	// no dedicated one and the ordinary chain answers.
+	Vision      string
+	VisionFalls []string
+	// ImageGen is the chain the generate_image tool calls. Empty means the
+	// tool does not exist.
+	ImageGen      string
+	ImageGenFalls []string
 	// Web is tools.web.
 	Web Web
 }
+
+// Kind selects which chain a turn needs.
+type Kind string
+
+const (
+	// KindText is the ordinary conversation chain.
+	KindText Kind = "text"
+	// KindVision reads images. Falls back to the text chain when unconfigured,
+	// because a model that can see is a property of the model, not of a slot:
+	// a deployment whose only model is multimodal needs no second entry.
+	KindVision Kind = "vision"
+	// KindImageGen produces images. Does NOT fall back: a text model asked to
+	// generate an image returns prose describing one, which is worse than an
+	// absent tool because it looks like success.
+	KindImageGen Kind = "image"
+)
 
 // Find returns the spec for a model_name.
 func (r Registry) Find(name string) (ModelSpec, bool) {
@@ -213,7 +247,7 @@ func (r Registry) Find(name string) (ModelSpec, bool) {
 // crab-shell-proxy fills Turn.Model with the harness name as a placeholder
 // ("picoclaw", historically), so "the turn named a model I do not have" is the
 // ordinary case on every single turn, not an anomaly worth a frame.
-func (r Registry) Chain(turnModel string) []string {
+func (r Registry) Chain(turnModel string, kind Kind) []string {
 	var out []string
 	seen := map[string]bool{}
 	add := func(names ...string) {
@@ -230,11 +264,26 @@ func (r Registry) Chain(turnModel string) []string {
 		}
 	}
 
-	if _, ok := r.Find(turnModel); ok {
-		add(turnModel)
-	} else {
-		add(r.Default)
-		add(r.DefaultFallbacks...)
+	switch kind {
+	case KindVision:
+		add(r.Vision)
+		add(r.VisionFalls...)
+		if len(out) == 0 {
+			// No dedicated vision chain. The ordinary one answers, and if its
+			// model cannot see, the loop's degradation path is what the member
+			// meets -- not a refusal here.
+			return r.Chain(turnModel, KindText)
+		}
+	case KindImageGen:
+		add(r.ImageGen)
+		add(r.ImageGenFalls...)
+	default:
+		if _, ok := r.Find(turnModel); ok {
+			add(turnModel)
+		} else {
+			add(r.Default)
+			add(r.DefaultFallbacks...)
+		}
 	}
 	// Each entry's own fallbacks extend the chain, one level, the way
 	// picoclaw's resolveModelCandidates does. Bounded by the loop over a
@@ -302,6 +351,11 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 	if reg.Default == "" && len(reg.Models) > 0 {
 		reg.Default = reg.Models[0].Name
 	}
+
+	reg.Vision = f.Agents.Defaults.ImageModel
+	reg.VisionFalls = f.Agents.Defaults.ImageModelFallbacks
+	reg.ImageGen = f.Agents.Defaults.ImageGenModel
+	reg.ImageGenFalls = f.Agents.Defaults.ImageGenModelFallbacks
 
 	web, err := loadWeb(f.Tools.Web, res, keyEnv)
 	if err != nil {

@@ -93,14 +93,14 @@ func TestAChangedFileIsPickedUpAtTheNextTurn(t *testing.T) {
 	}
 	r, _ := newTest(t, current, path, func() (config.Registry, error) { return current, nil })
 
-	if got := r.Chain(""); !reflect.DeepEqual(got, []string{"a"}) {
+	if got := r.Chain("", domain.ModelText); !reflect.DeepEqual(got, []string{"a"}) {
 		t.Fatalf("chain = %v, want [a]", got)
 	}
 
 	current = config.Registry{Default: "b", Models: []config.ModelSpec{spec("b", "y", "https://e/v1", "k")}}
 	touch(t, path)
 
-	if got := r.Chain(""); !reflect.DeepEqual(got, []string{"b"}) {
+	if got := r.Chain("", domain.ModelText); !reflect.DeepEqual(got, []string{"b"}) {
 		t.Fatalf("chain = %v after the file changed, want [b]", got)
 	}
 }
@@ -119,7 +119,7 @@ func TestABrokenReloadKeepsTheRunningRegistry(t *testing.T) {
 	})
 
 	touch(t, path)
-	if got := r.Chain(""); !reflect.DeepEqual(got, []string{"a"}) {
+	if got := r.Chain("", domain.ModelText); !reflect.DeepEqual(got, []string{"a"}) {
 		t.Fatalf("chain = %v after a failed reload, want the previous [a]", got)
 	}
 }
@@ -135,7 +135,7 @@ func TestAnEmptyReloadKeepsTheRunningRegistry(t *testing.T) {
 	r, _ := newTest(t, good, path, func() (config.Registry, error) { return config.Registry{}, nil })
 
 	touch(t, path)
-	if got := r.Chain(""); !reflect.DeepEqual(got, []string{"a"}) {
+	if got := r.Chain("", domain.ModelText); !reflect.DeepEqual(got, []string{"a"}) {
 		t.Fatalf("chain = %v after an empty reload, want the previous [a]", got)
 	}
 }
@@ -155,9 +155,9 @@ func TestABrokenFileIsNotRereadEveryTurn(t *testing.T) {
 	})
 
 	touch(t, path)
-	r.Chain("")
-	r.Chain("")
-	r.Chain("")
+	r.Chain("", domain.ModelText)
+	r.Chain("", domain.ModelText)
+	r.Chain("", domain.ModelText)
 	if reads != 1 {
 		t.Fatalf("the broken file was read %d times, want 1", reads)
 	}
@@ -169,7 +169,7 @@ func TestNoPathMeansNoReload(t *testing.T) {
 	reads := 0
 	r, _ := newTest(t, config.Registry{Default: "a", Models: []config.ModelSpec{spec("a", "x", "https://e/v1", "k")}},
 		"", func() (config.Registry, error) { reads++; return config.Registry{}, nil })
-	r.Chain("")
+	r.Chain("", domain.ModelText)
 	if reads != 0 {
 		t.Fatalf("reloaded %d times with no path configured, want 0", reads)
 	}

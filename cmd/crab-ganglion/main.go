@@ -29,6 +29,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -234,6 +235,10 @@ func tools(workspace, self string, reg config.Registry, logger *log.Logger) []to
 	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
 		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))
 		logger.Printf("tools: web_search and web_fetch enabled")
+	}
+	if g := imagegen.New(reg, workspace, nil, logger.Printf); g != nil {
+		out = append(out, g)
+		logger.Printf("tools: generate_image enabled")
 	}
 	return out
 }
