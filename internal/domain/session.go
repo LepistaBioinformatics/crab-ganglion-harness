@@ -52,6 +52,19 @@ type Completion struct {
 	Tools    []ToolSchema
 	System   string
 	Messages []Message
+	// ThinkingLevel is the depth THIS turn asked for, one of the names in
+	// thinking.go. Empty means the model's own configured level applies, which
+	// is the only case that existed before agent-selected depth.
+	//
+	// A name, never a wire shape: the adapter decides what `high` looks like on
+	// the request (AR-2).
+	ThinkingLevel string
+	// NoThinking suppresses the depth field entirely, whatever either level
+	// says. The loop sets it after a request carrying depth failed on this
+	// model, so the retry is the same request minus the field that may have
+	// caused the failure. Without it there is no way to say "send none": an
+	// empty ThinkingLevel means "use the configured one".
+	NoThinking bool
 }
 
 // ActionRequest is a proposed tool invocation put to an Approver (FR-7).

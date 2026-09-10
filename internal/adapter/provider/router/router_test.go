@@ -195,3 +195,27 @@ func contains(haystack, needle string) bool {
 		return false
 	})()
 }
+
+// SendsThinking is what tells the loop a failed request is worth retrying
+// without its depth field. Getting it wrong in the permissive direction doubles
+// the latency of every failure in the chain.
+func TestSendsThinkingFollowsTheModelsDeclaration(t *testing.T) {
+	reg := config.Registry{
+		Default: "deep",
+		Models: []config.ModelSpec{
+			{Name: "deep", APIBase: "https://a", Enabled: true, ThinkingLevel: "high"},
+			{Name: "plain", APIBase: "https://b", Enabled: true},
+		},
+	}
+	r := New(reg, "", func(config.ModelSpec) domain.Provider { return nil }, nil, nil)
+
+	if !r.SendsThinking("deep") {
+		t.Error("a model declaring thinking_level must report true")
+	}
+	if r.SendsThinking("plain") {
+		t.Error("a model declaring none must report false")
+	}
+	if r.SendsThinking("absent") {
+		t.Error("an unknown model must report false")
+	}
+}

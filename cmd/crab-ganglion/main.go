@@ -33,6 +33,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/loadimage"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/thinking"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -106,11 +107,15 @@ func main() {
 	}
 	reg := models.Registry()
 	logger.Printf("models: %d configured, default %q", len(reg.Models), reg.Default)
+	for _, w := range reg.Warnings {
+		logger.Printf("models: %s", w)
+	}
 
 	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
 	loop := &runtime.Loop{
 		Provider:   models,
 		Models:     models,
+		Thinking:   models,
 		Transcript: transcript,
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
@@ -245,6 +250,19 @@ func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) 
 		c := openai.New(m.APIBase, m.APIKey, hc)
 		c.ExtraBody = m.ExtraBody
 		c.Headers = m.Headers
+		c.ThinkingLevel = m.ThinkingLevel
+		c.ThinkingBody = m.ThinkingBody
+		// The ceiling, said once. reasoning_effort has three steps and the
+		// vocabulary has five, so xhigh cannot mean more than high on this wire
+		// -- an operator who configured the top level deserves to know that
+		// before the answers disappoint them, and thinking_body is the way out.
+		if m.ThinkingLevel == config.ThinkingXHigh {
+			if _, overridden := m.ThinkingBody[config.ThinkingXHigh]; !overridden {
+				logger.Printf("models: %q asks for thinking_level %q, which this wire sends as %q; "+
+					"set thinking_body.xhigh to send something else",
+					m.Name, config.ThinkingXHigh, config.ThinkingHigh)
+			}
+		}
 		return c
 	}
 	return router.New(reg, path, build, load, logger.Printf), nil
@@ -267,6 +285,15 @@ func tools(workspace, self string, reg config.Registry, logger *log.Logger) []to
 	// varies is whether a model can SEE the result, which the vision chain
 	// decides at completion time rather than here.
 	out := []tool.Tool{shellTool(workspace, self), loadimage.New(workspace)}
+	if d := thinking.New(reg); d != nil {
+		out = append(out, d)
+		logger.Printf("tools: set_reasoning_depth enabled")
+	} else {
+		// Named, because the absence is invisible otherwise: a deployment whose
+		// models declare no thinking_level will never think deeply and will
+		// look exactly like one that does.
+		logger.Printf("tools: set_reasoning_depth unavailable -- no model declares thinking_level")
+	}
 	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
 		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))
 		logger.Printf("tools: web_search and web_fetch enabled")

@@ -18,6 +18,10 @@ type fakeProvider struct {
 	calls      int
 	err        error
 	onComplete func(domain.Completion)
+	// gate decides per REQUEST whether Complete fails, which err cannot: the
+	// depth degradation is "this request shape fails and that one does not",
+	// and a single err would fail both halves of it.
+	gate func(domain.Completion) error
 }
 
 type fakeTurn struct {
@@ -33,6 +37,11 @@ func (p *fakeProvider) Complete(_ context.Context, c domain.Completion) (domain.
 	}
 	if p.err != nil {
 		return nil, p.err
+	}
+	if p.gate != nil {
+		if err := p.gate(c); err != nil {
+			return nil, err
+		}
 	}
 	t := p.turns[min(p.calls, len(p.turns)-1)]
 	p.calls++

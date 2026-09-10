@@ -51,6 +51,23 @@ type Client struct {
 	// declared here cannot replace the bearer -- a config key that could would
 	// let one model's configuration send another model's key.
 	Headers map[string]string
+
+	// ThinkingLevel is this model's configured depth, from picoclaw's
+	// `thinking_level`. EMPTY MEANS NO DEPTH FIELD IS EVER SENT to this
+	// endpoint, whatever a turn asks for.
+	//
+	// That is the capability declaration, and it is the operator's to make.
+	// picoclaw needs a provider table here because it speaks four dialects and
+	// can therefore know that DeepSeek takes reasoning_effort and Zhipu does
+	// not; this adapter speaks one wire to every endpoint in the registry and
+	// cannot tell them apart. Sending a field an endpoint rejects would turn
+	// depth selection into a turn failure, which is the production shape
+	// `vision-unsupported-glm` already cost us once.
+	ThinkingLevel string
+
+	// ThinkingBody overrides thinkingFor's default per level. A level present
+	// here replaces that row entirely, including with {} to emit nothing.
+	ThinkingBody map[string]map[string]json.RawMessage
 }
 
 func New(baseURL, apiKey string, hc *http.Client) *Client {
@@ -65,28 +82,74 @@ var reserved = map[string]bool{
 	"model": true, "stream": true, "messages": true, "tools": true, "stream_options": true,
 }
 
-// encode marshals the request and merges ExtraBody over it.
+// effort maps a level onto the OpenAI-compatible vocabulary.
+//
+// `xhigh` collapses onto `high` because reasoning_effort has no fourth step and
+// inventing one would send a value no endpoint recognises. An operator whose
+// provider does have a higher step reaches it through ThinkingBody, and the
+// collapse is logged once per model at boot so the ceiling is known rather than
+// discovered.
+//
+// `adaptive` emits nothing: it means "the provider decides", and the way to say
+// that on this wire is to say nothing.
+var effort = map[string]string{
+	"off": "none", "low": "low", "medium": "medium", "high": "high", "xhigh": "high",
+}
+
+// thinkingFor returns the fields this request should carry for the level, or
+// nil for none.
+func (c *Client) thinkingFor(req domain.Completion) map[string]json.RawMessage {
+	// The model never declared a level, so it is never sent one. This beats
+	// anything the turn asked for -- an agent that chooses `xhigh` on a model
+	// the operator did not vouch for gets nothing, not a 400.
+	if req.NoThinking || c.ThinkingLevel == "" {
+		return nil
+	}
+	level := req.ThinkingLevel
+	if level == "" {
+		level = c.ThinkingLevel
+	}
+	if over, ok := c.ThinkingBody[level]; ok {
+		return over
+	}
+	e, ok := effort[level]
+	if !ok {
+		return nil
+	}
+	return map[string]json.RawMessage{"reasoning_effort": json.RawMessage(`"` + e + `"`)}
+}
+
+// encode marshals the request and merges the depth fields, then ExtraBody, over
+// it.
 //
 // Two marshal passes rather than a struct with an inline map, because the
 // merge has to happen at the top level of an object whose other fields are
 // typed -- and encoding/json offers no way to say that.
+//
+// ORDER MATTERS AND IS ASSERTED. ExtraBody goes LAST, so an operator who pinned
+// `extra_body.reasoning_effort` keeps it: they said "always this", and a
+// feature that quietly won that argument would be a config key that stopped
+// meaning what it says.
 func (c *Client) encode(req domain.Completion) ([]byte, error) {
 	body, err := json.Marshal(buildRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	if len(c.ExtraBody) == 0 {
+	think := c.thinkingFor(req)
+	if len(c.ExtraBody) == 0 && len(think) == 0 {
 		return body, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
-		return nil, fmt.Errorf("merge extra_body: %w", err)
+		return nil, fmt.Errorf("merge request body: %w", err)
 	}
-	for k, v := range c.ExtraBody {
-		if reserved[k] {
-			continue
+	for _, m := range []map[string]json.RawMessage{think, c.ExtraBody} {
+		for k, v := range m {
+			if reserved[k] {
+				continue
+			}
+			obj[k] = v
 		}
-		obj[k] = v
 	}
 	return json.Marshal(obj)
 }
