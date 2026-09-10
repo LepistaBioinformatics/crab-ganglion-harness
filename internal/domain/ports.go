@@ -31,6 +31,17 @@ type ModelChain interface {
 	Chain(turnModel string, kind ModelKind) []string
 }
 
+// ThinkingChain reports whether a model would be sent a reasoning-depth field.
+//
+// It exists for exactly one decision: whether a failed request is worth
+// retrying without depth. Retrying unconditionally would double the latency of
+// every failure on every model, most of which carry no depth field and cannot
+// have failed because of one. Only the component holding the registry knows,
+// so it is asked rather than guessed.
+type ThinkingChain interface {
+	SendsThinking(model string) bool
+}
+
 // Learner observes completed turns.
 //
 // A port rather than a call into a package, for the reason AR-2 gives: what
@@ -66,6 +77,12 @@ type TurnRecord struct {
 	// look perfect.
 	Failed bool
 	At     time.Time
+	// Thinking is the depth the agent chose for this turn, if it chose one, and
+	// Why is the line it gave. Recorded so evolution can observe whether going
+	// deep correlates with succeeding -- which is the only way anyone will ever
+	// learn whether the tool is being used well.
+	Thinking string
+	Why      string
 }
 
 // ToolOutcome is one tool invocation inside a turn.

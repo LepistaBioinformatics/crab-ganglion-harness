@@ -85,6 +85,20 @@ func (r *Router) stamp() {
 	}
 }
 
+// SendsThinking reports whether this model would carry a reasoning-depth field,
+// which is what tells the loop that a failed request is worth retrying without
+// one (domain.ThinkingChain).
+//
+// No refresh here: it is asked DURING a turn, and Chain already pinned the
+// registry for that turn at its start. Re-reading mid-turn is the one thing
+// this router is built not to do.
+func (r *Router) SendsThinking(model string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	m, ok := r.reg.Find(model)
+	return ok && m.ThinkingLevel != ""
+}
+
 // Chain answers the loop's "which models, in what order" and is also the
 // reload point.
 //
@@ -136,6 +150,12 @@ func (r *Router) refresh() {
 	}
 	r.adopt(reg)
 	r.logf("model registry %s reloaded: %d model(s), default %q", r.path, len(reg.Models), reg.Default)
+	// Once per reload, and a reload only happens when the file actually
+	// changed -- so an operator who just saved a typo hears about it now
+	// rather than at the next restart.
+	for _, w := range reg.Warnings {
+		r.logf("model registry %s: %s", r.path, w)
+	}
 }
 
 // Complete dispatches to the client for req.Model.

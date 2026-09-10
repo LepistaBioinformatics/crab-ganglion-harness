@@ -84,6 +84,21 @@ type ModelSpec struct {
 	Enabled bool
 	// Fallbacks names other entries to try after this one.
 	Fallbacks []string
+	// ThinkingLevel is picoclaw's `thinking_level`: off|low|medium|high|xhigh|
+	// adaptive. Empty means this model is NEVER sent a depth field, by any
+	// path -- declaring the key IS the capability declaration, because the
+	// harness cannot discover whether an endpoint accepts one and the operator
+	// can.
+	ThinkingLevel string
+	// ThinkingBody overrides the default wire mapping per level, keyed by
+	// level name. It is the one mechanism by which a provider dialect the
+	// adapter does not know is taught to it without a code change:
+	//
+	//	"thinking_body": {"xhigh": {"reasoning_effort": "max"}}
+	//
+	// A level present here fully replaces the default row for that level,
+	// including replacing it with {} to emit nothing.
+	ThinkingBody map[string]map[string]json.RawMessage
 }
 
 // file is the on-disk shape. Every field is a pointer or a slice so that
@@ -107,6 +122,12 @@ type file struct {
 		ExtraBody      map[string]json.RawMessage `json:"extra_body"`
 		CustomHeaders  map[string]string          `json:"custom_headers"`
 		RequestTimeout int                        `json:"request_timeout"`
+		// ThinkingLevel is picoclaw's own key, same name and same six values.
+		ThinkingLevel string `json:"thinking_level"`
+		// ThinkingBody has no picoclaw equivalent. It is named to sit beside
+		// thinking_level so a picoclaw that grows per-level bodies has an
+		// obvious place to land, and picoclaw ignores it today.
+		ThinkingBody map[string]map[string]json.RawMessage `json:"thinking_body"`
 	} `json:"model_list"`
 
 	Agents struct {
@@ -224,6 +245,12 @@ type Registry struct {
 	Web Web
 	// Evolution is the evolution block, with picoclaw's defaults applied.
 	Evolution Evolution
+	// Warnings are operator mistakes that are not errors: a key whose value
+	// could not be read, where refusing to boot would be worse than carrying
+	// on without it. Carried out rather than logged here because this package
+	// has no logger, and because the router reloads this file on every turn --
+	// the caller decides whether a repeated warning is worth repeating.
+	Warnings []string
 }
 
 // EvolutionMode is the opt-in ladder. Each rung does strictly more than the one
@@ -295,6 +322,43 @@ const (
 	// absent tool because it looks like success.
 	KindImageGen Kind = "image"
 )
+
+// Reasoning depth.
+//
+// The vocabulary is picoclaw's, exactly: `model_list[].thinking_level` with
+// these six values (pkg/config/config.go:780). A seventh would break the admin
+// editor that already renders the field, so there is no seventh.
+const (
+	ThinkingOff      = "off"
+	ThinkingLow      = "low"
+	ThinkingMedium   = "medium"
+	ThinkingHigh     = "high"
+	ThinkingXHigh    = "xhigh"
+	ThinkingAdaptive = "adaptive"
+)
+
+// ThinkingLevels is the vocabulary in ascending order of effort, with adaptive
+// last because it is not a point on that scale -- it hands the decision to the
+// provider rather than naming an amount.
+var ThinkingLevels = []string{
+	ThinkingOff, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh, ThinkingAdaptive,
+}
+
+// ParseThinkingLevel normalizes a configured or model-chosen level.
+//
+// Case-insensitive and whitespace-tolerant, matching picoclaw's own parser
+// (pkg/agent/thinking.go:16-54). An unrecognised value yields ok=false rather
+// than a default: picoclaw reads unknown as `off`, which makes a typo look
+// exactly like a deliberate choice to think less.
+func ParseThinkingLevel(s string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(s))
+	for _, l := range ThinkingLevels {
+		if v == l {
+			return l, true
+		}
+	}
+	return "", false
+}
 
 // Find returns the spec for a model_name.
 func (r Registry) Find(name string) (ModelSpec, bool) {
@@ -402,6 +466,21 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 			TimeoutSec: e.RequestTimeout,
 			Enabled:    e.Enabled == nil || *e.Enabled,
 			Fallbacks:  e.Fallbacks,
+
+			ThinkingBody: e.ThinkingBody,
+		}
+		// An unparseable level is ABSENT, not `off`. picoclaw reads unknown as
+		// off, which makes a typo indistinguishable from a deliberate choice to
+		// think less -- and a model that silently never thinks looks like a
+		// working configuration right up to the bill.
+		if e.ThinkingLevel != "" {
+			if lvl, ok := ParseThinkingLevel(e.ThinkingLevel); ok {
+				spec.ThinkingLevel = lvl
+			} else {
+				reg.Warnings = append(reg.Warnings, fmt.Sprintf(
+					"model %q: thinking_level %q is not one of %s; the model will be sent no depth field",
+					spec.Name, e.ThinkingLevel, strings.Join(ThinkingLevels, "|")))
+			}
 		}
 		// The model actually sent on the wire defaults to the alias, which is
 		// how picoclaw's own examples read when the two are the same string.

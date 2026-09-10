@@ -73,6 +73,11 @@ type Loop struct {
 	// Learner observes completed turns. Nil means nothing observes them, which
 	// is every deployment with evolution switched off -- and switched off is
 	// the default.
+	// Thinking answers "would this model carry a depth field", which is the
+	// only thing that makes the degradation in tryChain worth attempting. Nil
+	// means no model does, and no request is ever retried for that reason.
+	Thinking domain.ThinkingChain
+
 	Learner           domain.Learner
 	System            string
 	MaxIterations     int
@@ -122,6 +127,12 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "conversation.id", Value: string(t.SessionID)})
 	var runErr error
 	defer func() { end(runErr) }()
+
+	// The turn's reasoning depth, and its whole lifetime. A tool writes it, the
+	// next completion reads it, and it dies with the turn -- so a question the
+	// agent decided was hard does not silently bill every question after it.
+	depth := &domain.Depth{}
+	ctx = domain.WithDepth(ctx, depth)
 
 	// The member's message is durable BEFORE the model is called. A crash
 	// mid-turn must lose the answer, never the question.
@@ -179,6 +190,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			SessionID: t.SessionID, SessionKey: t.SessionKey, Model: c.modelFor(t),
 			Input: t.Input.Content, Answer: answer.String(), Tools: outcomes,
 			Usage: total, Duration: c.Now().Sub(started), Failed: failed, At: c.Now(),
+			Thinking: depth.Level(), Why: depth.Reason(),
 		})
 	}
 
@@ -215,7 +227,20 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		}
 
 		for _, call := range msg.ToolCalls {
+			chosen := depth.Level()
 			res, err := c.runTool(ctx, t, call, sink)
+			// Said out loud when it changes. A turn that suddenly takes four
+			// times as long, and costs four times as much, is owed a sentence
+			// saying the agent decided the question was hard -- and the reason
+			// it gave is the only evidence anyone will ever have about whether
+			// it decided well.
+			if lvl := depth.Level(); lvl != chosen {
+				text := "thinking at depth " + lvl
+				if why := depth.Reason(); why != "" {
+					text += ": " + why
+				}
+				sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: text})
+			}
 			if err != nil {
 				runErr = err
 				sink.EmitError(err.Error())
@@ -359,8 +384,25 @@ func (l *Loop) tryChain(
 	answersAt time.Time, alreadySaid string, chain []string,
 ) (domain.Message, domain.Usage, error) {
 	var lastErr error
+	depth := domain.DepthFrom(ctx)
 	for i, model := range chain {
 		msg, usage, emitted, err := l.complete(ctx, t, w, sink, answersAt, alreadySaid, model)
+
+		// THE DEPTH DEGRADATION, and it is the same argument the image
+		// degradation above makes. A model that rejects `reasoning_effort`
+		// rejects it on every turn, so a chain that walked past it would spend
+		// the fallback budget on a field nobody asked for -- and a chain of one
+		// would simply stop answering. So the field comes off and the SAME
+		// model is asked again, once.
+		//
+		// Guarded by emitted for the reason the whole file is: once a byte has
+		// reached the member, this turn belongs to this model and a second
+		// attempt would splice two answers into one bubble.
+		if err != nil && !emitted && l.sendsThinking(model) && !depth.Suppressed(model) {
+			depth.Suppress(model)
+			msg, usage, emitted, err = l.complete(ctx, t, w, sink, answersAt, alreadySaid, model)
+		}
+
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -427,6 +469,12 @@ func (l *Loop) modelsFor(t domain.Turn, w domain.Window) []string {
 	return []string{l.modelFor(t)}
 }
 
+// sendsThinking is nil-safe: no chain wired means no model carries depth, so
+// nothing is ever retried for that reason.
+func (l *Loop) sendsThinking(model string) bool {
+	return l.Thinking != nil && l.Thinking.SendsThinking(model)
+}
+
 func hasAttachments(w domain.Window) bool {
 	for _, m := range w.Messages {
 		if len(m.Attachments) > 0 {
@@ -472,12 +520,19 @@ func (l *Loop) complete(
 	defer func() { end(err) }()
 
 	var emitted bool
+	// Read from the context rather than passed down: the cell is per turn and
+	// every caller of complete is inside one, so threading it through four
+	// signatures would say nothing the context does not already say.
+	depth := domain.DepthFrom(ctx)
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
 		Model:    model,
 		Window:   w,
 		System:   l.systemFor(ctx),
 		Tools:    l.Tools.Available(ctx),
 		Messages: w.Messages,
+
+		ThinkingLevel: depth.Level(),
+		NoThinking:    depth.Suppressed(model),
 	})
 	if err != nil {
 		return domain.Message{}, domain.Usage{}, emitted, fmt.Errorf("provider: %w", err)
