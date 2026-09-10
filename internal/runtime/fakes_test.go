@@ -14,9 +14,10 @@ import (
 // port split, so it is asserted here by construction.
 
 type fakeProvider struct {
-	turns []fakeTurn // one per Complete call, in order
-	calls int
-	err   error
+	turns      []fakeTurn // one per Complete call, in order
+	calls      int
+	err        error
+	onComplete func(domain.Completion)
 }
 
 type fakeTurn struct {
@@ -26,7 +27,10 @@ type fakeTurn struct {
 	err    error
 }
 
-func (p *fakeProvider) Complete(context.Context, domain.Completion) (domain.Stream, error) {
+func (p *fakeProvider) Complete(_ context.Context, c domain.Completion) (domain.Stream, error) {
+	if p.onComplete != nil {
+		p.onComplete(c)
+	}
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -61,7 +65,7 @@ type fakeTranscript struct {
 	err error
 }
 
-func (f *fakeTranscript) Append(_ context.Context, _ domain.SessionKey, m domain.Message) error {
+func (f *fakeTranscript) Append(_ context.Context, _ domain.ConversationID, m domain.Message) error {
 	if f.err != nil {
 		return f.err
 	}
@@ -71,7 +75,7 @@ func (f *fakeTranscript) Append(_ context.Context, _ domain.SessionKey, m domain
 	return nil
 }
 
-func (f *fakeTranscript) Read(context.Context, domain.SessionKey) ([]domain.Message, error) {
+func (f *fakeTranscript) Read(context.Context, domain.ConversationID) ([]domain.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]domain.Message(nil), f.log...), nil
@@ -83,12 +87,12 @@ type fakeContext struct {
 	loaded int
 }
 
-func (f *fakeContext) Load(context.Context, domain.SessionKey) (domain.Window, error) {
+func (f *fakeContext) Load(context.Context, domain.ConversationID) (domain.Window, error) {
 	f.loaded++
 	return f.w, nil
 }
 
-func (f *fakeContext) Save(_ context.Context, _ domain.SessionKey, w domain.Window) error {
+func (f *fakeContext) Save(_ context.Context, _ domain.ConversationID, w domain.Window) error {
 	f.saved = append(f.saved, w)
 	f.w = w
 	return nil

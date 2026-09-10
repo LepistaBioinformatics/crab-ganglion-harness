@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // The ports. Adapters implement these; the runtime depends on nothing else.
 //
@@ -32,15 +35,28 @@ type Stream interface {
 // the served transcript, so it cannot shorten it. This is the structural answer
 // to the 102-of-465 loss measured on picoclaw.
 type TranscriptStore interface {
-	Append(ctx context.Context, key SessionKey, m Message) error
-	Read(ctx context.Context, key SessionKey) ([]Message, error)
+	Append(ctx context.Context, id ConversationID, m Message) error
+	Read(ctx context.Context, id ConversationID) ([]Message, error)
+}
+
+// Checkpointer records an answer that is still streaming, so a turn that dies
+// mid-stream does not lose what the member already watched appear.
+//
+// Separate from TranscriptStore on purpose. TranscriptStore's whole value is
+// that it CANNOT rewrite anything; a checkpoint is rewritten constantly. Two
+// interfaces keep that distinction enforceable instead of a comment -- and a
+// store that cannot checkpoint stays usable, which is what the loop's
+// nil-check relies on.
+type Checkpointer interface {
+	Checkpoint(ctx context.Context, id ConversationID, answersAt time.Time, content string) error
+	ClearPartial(ctx context.Context, id ConversationID) error
 }
 
 // ContextStore holds the derived window. Rewriting it is normal and lossless in
 // the sense that matters: it can always be rebuilt from the transcript.
 type ContextStore interface {
-	Load(ctx context.Context, key SessionKey) (Window, error)
-	Save(ctx context.Context, key SessionKey, w Window) error
+	Load(ctx context.Context, id ConversationID) (Window, error)
+	Save(ctx context.Context, id ConversationID, w Window) error
 }
 
 // ToolExecutor runs one tool call.

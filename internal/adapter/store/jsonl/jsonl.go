@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
@@ -23,6 +25,14 @@ import (
 // answers -- a lesson the Hermes runner recorded after its SSE scanner hit
 // exactly this.
 const maxLine = 8 << 20
+
+// Compile-time proof that one Store satisfies both ports. Without these, a
+// signature drift shows up as a nil field in the composition root at runtime
+// rather than as a build failure here.
+var (
+	_ domain.TranscriptStore = (*Store)(nil)
+	_ domain.Checkpointer    = (*Store)(nil)
+)
 
 // Store writes transcripts under Root.
 type Store struct {
@@ -33,13 +43,13 @@ type Store struct {
 
 func New(root string) *Store { return &Store{Root: root} }
 
-func (s *Store) path(key domain.SessionKey) string {
-	return filepath.Join(s.Root, safe(string(key))+".jsonl")
+func (s *Store) path(id domain.ConversationID) string {
+	return filepath.Join(s.Root, safe(string(id))+".jsonl")
 }
 
 // Append adds one message. The write is O(1) in the file's size, which is what
 // makes an append-only transcript affordable for a long conversation.
-func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Message) error {
+func (s *Store) Append(_ context.Context, id domain.ConversationID, m domain.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -50,7 +60,7 @@ func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Messag
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
-	f, err := os.OpenFile(s.path(key), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(s.path(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("open transcript: %w", err)
 	}
@@ -58,16 +68,132 @@ func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Messag
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("write transcript: %w", err)
 	}
+	// D-1. Without this the bytes sit in the page cache, which survives the
+	// process and the container but not the host. Measured at 887us on the
+	// volume these containers mount -- three per ordinary turn, against seconds
+	// of provider latency, so there is nothing here to batch (spec OQ-1).
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync transcript: %w", err)
+	}
 	return nil
+}
+
+// partialPath is the sidecar holding an in-flight answer.
+//
+// It is a SEPARATE FILE, and that is the whole design (design.md D-2/D-3):
+// the transcript stays byte-identical to what it was, so internal/history's
+// existing parser cannot see a checkpoint and render it as a message. Marking
+// partials inside the JSONL was the obvious alternative and it fails exactly
+// there -- an older reader would show the same growing answer once per
+// checkpoint.
+func (s *Store) partialPath(id domain.ConversationID) string {
+	return filepath.Join(s.Root, safe(string(id))+".partial.json")
+}
+
+// Partial is an answer that was still streaming.
+type Partial struct {
+	// AnswersAt is the created_at of the user message this turn is answering.
+	// It is what decides whether the sidecar is live, with no turn id needed:
+	// a sidecar is stale once the transcript holds an assistant message at or
+	// after this instant.
+	AnswersAt time.Time `json:"answers_at"`
+	Content   string    `json:"content"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Checkpoint durably records the answer produced so far.
+//
+// Rewriting this file is fine -- it is derived, like the context window. The
+// append-only invariant belongs to the transcript, and the transcript is not
+// this file.
+func (s *Store) Checkpoint(_ context.Context, id domain.ConversationID, answersAt time.Time, content string) error {
+	p := Partial{AnswersAt: answersAt, Content: content, UpdatedAt: time.Now()}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := os.MkdirAll(s.Root, 0o755); err != nil {
+		return fmt.Errorf("transcript dir: %w", err)
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.Root, ".partial-*")
+	if err != nil {
+		return fmt.Errorf("temp partial: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write partial: %w", err)
+	}
+	// Sync before the rename, or the rename can land with no content behind it.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync partial: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), s.partialPath(id))
+}
+
+// ClearPartial removes the sidecar. Called after the real message is appended.
+//
+// The crash window between that append and this call is exactly what
+// Partial.AnswersAt exists to make harmless: a reader finding both sees an
+// assistant message at or after AnswersAt and ignores the sidecar.
+func (s *Store) ClearPartial(_ context.Context, id domain.ConversationID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.Remove(s.partialPath(id))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// ReadPartial returns the sidecar when it is LIVE -- when the transcript holds
+// no assistant message that answers it.
+//
+// ok is false for "no sidecar" and for "superseded"; both mean a reader has
+// nothing to add, and distinguishing them would invite a caller to treat a
+// stale partial as recoverable.
+func (s *Store) ReadPartial(ctx context.Context, id domain.ConversationID) (Partial, bool, error) {
+	b, err := os.ReadFile(s.partialPath(id))
+	if os.IsNotExist(err) {
+		return Partial{}, false, nil
+	}
+	if err != nil {
+		return Partial{}, false, err
+	}
+	var p Partial
+	if err := json.Unmarshal(b, &p); err != nil {
+		// A half-written sidecar is not worth failing a history read over. The
+		// atomic rename should make this unreachable; treating it as "nothing
+		// to recover" is the safe direction.
+		return Partial{}, false, nil
+	}
+
+	msgs, err := s.Read(ctx, id)
+	if err != nil {
+		return Partial{}, false, err
+	}
+	for _, m := range msgs {
+		if m.Role == domain.RoleAssistant && !m.CreatedAt.Before(p.AnswersAt) {
+			return Partial{}, false, nil // the turn finished; sidecar is stale
+		}
+	}
+	return p, true, nil
 }
 
 // Read returns the whole transcript. A missing file is an empty conversation,
 // not an error -- the first turn of every session reads before it writes.
-func (s *Store) Read(_ context.Context, key domain.SessionKey) ([]domain.Message, error) {
+func (s *Store) Read(_ context.Context, id domain.ConversationID) ([]domain.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.Open(s.path(key))
+	f, err := os.Open(s.path(id))
 	if os.IsNotExist(err) {
 		return []domain.Message{}, nil
 	}
@@ -95,6 +221,72 @@ func (s *Store) Read(_ context.Context, key domain.SessionKey) ([]domain.Message
 		return out, fmt.Errorf("scan transcript: %w", err)
 	}
 	return out, nil
+}
+
+// RecoverPartials folds interrupted answers into the transcript and drops the
+// stale sidecars, returning how many of each it handled.
+//
+// Run at start, which under scale-to-zero is "the turn after the crash". It is
+// what makes recovery PERMANENT: until it runs, a live sidecar is visible only
+// because readers fold it on the fly, and it would never enter the context the
+// model sees on the next turn. After it runs, the interrupted answer is an
+// ordinary message and nothing special reads it.
+//
+// The partial's text is appended as-is, with no marker. It is what the member
+// watched appear; an answer cut mid-sentence already reads as cut, and a marker
+// field would be invisible to internal/history's parser anyway (H-2).
+func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err error) {
+	entries, rerr := os.ReadDir(s.Root)
+	if os.IsNotExist(rerr) {
+		return 0, 0, nil
+	}
+	if rerr != nil {
+		return 0, 0, fmt.Errorf("scan sessions: %w", rerr)
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".partial.json") {
+			continue
+		}
+		id := domain.ConversationID(strings.TrimSuffix(name, ".partial.json"))
+
+		p, live, perr := s.ReadPartial(ctx, id)
+		if perr != nil {
+			// One unreadable sidecar must not stop the others from being
+			// recovered -- this runs at boot, and a boot that fails on a
+			// leftover file is worse than the leftover.
+			continue
+		}
+		if !live {
+			if s.ClearPartial(ctx, id) == nil {
+				dropped++
+			}
+			continue
+		}
+		if strings.TrimSpace(p.Content) == "" {
+			// A checkpoint that caught nothing. Dropping it is not data loss.
+			if s.ClearPartial(ctx, id) == nil {
+				dropped++
+			}
+			continue
+		}
+		msg := domain.Message{
+			Role:    domain.RoleAssistant,
+			Content: p.Content,
+			// The instant the checkpoint was taken, not now: this message
+			// belongs to the turn that died, and dating it now would place it
+			// after messages that came later.
+			CreatedAt: p.UpdatedAt,
+		}
+		if aerr := s.Append(ctx, id, msg); aerr != nil {
+			continue // leave the sidecar; the next start tries again
+		}
+		if s.ClearPartial(ctx, id) == nil {
+			folded++
+		}
+	}
+	return folded, dropped, nil
 }
 
 // safe keeps a session key from escaping Root. Keys come from the proxy, but a

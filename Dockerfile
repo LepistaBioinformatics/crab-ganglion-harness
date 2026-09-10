@@ -18,7 +18,21 @@ COPY . .
 RUN go vet ./... && go test ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/crab-ganglion ./cmd/crab-ganglion
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# Alpine, NOT distroless/static.
+#
+# Found by running it: distroless has no /bin/sh, and the shell tool is the only
+# tool this harness ships. The turn did not crash -- the agent was told "fork/exec
+# /bin/sh: no such file or directory", reacted, and explained it to the member,
+# which is DEC-2 working as designed -- but the tool could never succeed.
+#
+# distroless/static is for a pure-Go binary that spawns nothing. The moment a
+# tool shells out, the image has to contain what its tools need. Alpine's busybox
+# is also close to what picoclaw's own tool environment looked like, so a skill
+# written against one is not surprised by the other.
+#
+# The cost is ~8MB against AC-3's 150MB budget. Not close to binding.
+FROM alpine:3.21
+RUN adduser -D -u 1000 ganglion
 COPY --from=build /out/crab-ganglion /usr/local/bin/crab-ganglion
 # 1000:1000 matches what crab-shell-proxy already chowns per-user volumes to.
 USER 1000:1000

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -17,6 +18,9 @@ const (
 	DefaultApprovalTimeout   = 5 * time.Minute
 	DefaultApprovalHeartbeat = 10 * time.Second
 	DefaultWindowBudget      = 40
+	// DefaultCheckpointEvery is a WALL CLOCK, not a token count: a fast stream
+	// must not checkpoint per token, and a slow one must still checkpoint.
+	DefaultCheckpointEvery = 2 * time.Second
 )
 
 // ErrMaxIterations is returned inside the turn's report when the loop stopped
@@ -33,16 +37,34 @@ var ErrMaxIterations = errors.New("iteration cap reached before the agent finish
 type Loop struct {
 	Provider   domain.Provider
 	Transcript domain.TranscriptStore
-	Context    domain.ContextStore
-	Tools      domain.ToolExecutor
-	Approver   domain.Approver
-	Telemetry  domain.Telemetry
+	// Checkpoints may be nil: a store that cannot checkpoint simply does not,
+	// and the turn behaves as it did before D-2.
+	Checkpoints domain.Checkpointer
+	Context     domain.ContextStore
+	Tools       domain.ToolExecutor
+	Approver    domain.Approver
+	Telemetry   domain.Telemetry
 
+	// Model is the model this harness was configured with, and it is what
+	// every turn uses.
+	//
+	// The turn's own Model field is deliberately IGNORED in v1. The proxy fills
+	// it with a placeholder -- literally "picoclaw", the harness name, because
+	// that is what its /v1/models advertises and what a client echoes back --
+	// and forwarding that to a provider gets:
+	//
+	//   The supported API model names are deepseek-flash, deepseek-v4-pro,
+	//   but you passed picoclaw.
+	//
+	// Per-turn model selection is DF-4, deferred and answered 501 by the proxy,
+	// so there is nothing to honour yet. When it lands, this is where it goes.
+	Model             string
 	System            string
 	MaxIterations     int
 	ApprovalTimeout   time.Duration
 	ApprovalHeartbeat time.Duration
 	WindowBudget      int
+	CheckpointEvery   time.Duration
 
 	// Now is injectable so tests do not sleep.
 	Now func() time.Time
@@ -62,6 +84,9 @@ func (l *Loop) withDefaults() *Loop {
 	if c.WindowBudget <= 0 {
 		c.WindowBudget = DefaultWindowBudget
 	}
+	if c.CheckpointEvery <= 0 {
+		c.CheckpointEvery = DefaultCheckpointEvery
+	}
 	if c.Now == nil {
 		c.Now = time.Now
 	}
@@ -79,7 +104,7 @@ func (l *Loop) withDefaults() *Loop {
 func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string, error) {
 	c := l.withDefaults()
 
-	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "session.id", Value: t.SessionID})
+	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "conversation.id", Value: string(t.SessionID)})
 	var runErr error
 	defer func() { end(runErr) }()
 
@@ -90,44 +115,67 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	if in.CreatedAt.IsZero() {
 		in.CreatedAt = c.Now()
 	}
-	if runErr = c.Transcript.Append(ctx, t.SessionKey, in); runErr != nil {
+	if runErr = c.Transcript.Append(ctx, t.SessionID, in); runErr != nil {
 		return "", fmt.Errorf("append user message: %w", runErr)
 	}
 
-	window, err := c.Context.Load(ctx, t.SessionKey)
+	window, err := c.Context.Load(ctx, t.SessionID)
 	if err != nil {
 		runErr = fmt.Errorf("load context: %w", err)
 		return "", runErr
 	}
+	// Repair on load, not only on save. A window saved with an orphaned tool
+	// result -- by a build that predates dropOrphanTools -- would otherwise
+	// fail at the provider on every turn forever, because nothing else ever
+	// revisits the front of the window.
+	window = dropOrphanTools(window)
 	window.Messages = append(window.Messages, in)
 
-	var answer string
+	// What the member sees, accumulated across every iteration of this turn.
+	//
+	// The transcript records ONE assistant message per turn, holding exactly
+	// this. That is not a simplification -- it is what makes the served
+	// history match the stream.
+	//
+	// The stream is one continuous run of content: an iteration's narration,
+	// then tool progress, then the next iteration's text, all into one bubble.
+	// Writing the transcript per iteration instead produced a DIFFERENT shape
+	// -- crab-shell-proxy marks an assistant message carrying tool_calls as a
+	// "step" -- so when the turn ended and the client reconciled against the
+	// transcript, the single bubble was torn into narration plus answer and
+	// the whole reply visibly rewrote itself.
+	//
+	// Tool calls and results still reach the PROVIDER: they go into the
+	// context window, which is a separate artifact built separately below.
+	// Only the served history is collapsed.
+	var answer strings.Builder
 	var total domain.Usage
 
 	for i := 0; i < c.MaxIterations; i++ {
-		msg, usage, err := c.complete(ctx, t, window, sink)
+		msg, usage, err := c.complete(ctx, t, window, sink, in.CreatedAt, answer.String())
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
-			return answer, runErr
+			return answer.String(), runErr
 		}
 		total.Add(usage)
 
 		msg.CreatedAt = c.Now()
-		if err := c.Transcript.Append(ctx, t.SessionKey, msg); err != nil {
-			runErr = fmt.Errorf("append assistant message: %w", err)
-			return answer, runErr
-		}
+		// The WINDOW gets the message as the PROVIDER needs it: content and
+		// tool_calls together, so the tool results below answer a call it can
+		// see. The transcript gets one message for the whole turn, at the end.
 		window.Messages = append(window.Messages, msg)
-		if msg.Content != "" {
-			answer = msg.Content
-		}
+		answer.WriteString(msg.Content)
 
 		if len(msg.ToolCalls) == 0 {
+			if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
+				runErr = ferr
+				return answer.String(), runErr
+			}
 			c.recordUsage(ctx, total, t)
 			window = compact(window, c.WindowBudget)
-			runErr = c.Context.Save(ctx, t.SessionKey, window)
-			return answer, runErr
+			runErr = c.Context.Save(ctx, t.SessionID, window)
+			return answer.String(), runErr
 		}
 
 		for _, call := range msg.ToolCalls {
@@ -135,7 +183,8 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			if err != nil {
 				runErr = err
 				sink.EmitError(err.Error())
-				return answer, runErr
+				_ = c.finishTurn(ctx, t, answer.String())
+				return answer.String(), runErr
 			}
 			out := domain.Message{
 				Role:       domain.RoleTool,
@@ -143,37 +192,73 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				ToolCallID: call.ID,
 				CreatedAt:  c.Now(),
 			}
-			if err := c.Transcript.Append(ctx, t.SessionKey, out); err != nil {
-				runErr = fmt.Errorf("append tool result: %w", err)
-				return answer, runErr
-			}
+			// The tool result goes to the window only. The served transcript
+			// records what the member saw, and they never saw this.
 			window.Messages = append(window.Messages, out)
 		}
 
 		window = compact(window, c.WindowBudget)
-		if err := c.Context.Save(ctx, t.SessionKey, window); err != nil {
+		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
 			runErr = fmt.Errorf("save context: %w", err)
-			return answer, runErr
+			_ = c.finishTurn(ctx, t, answer.String())
+			return answer.String(), runErr
 		}
 	}
 
 	// FR-5: hitting the cap must be said out loud, not inferred later.
 	c.recordUsage(ctx, total, t)
 	sink.EmitError(ErrMaxIterations.Error())
-	if saveErr := c.Context.Save(ctx, t.SessionKey, compact(window, c.WindowBudget)); saveErr != nil {
-		return answer, saveErr
+	if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
+		return answer.String(), ferr
 	}
-	return answer, nil
+	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
+		return answer.String(), saveErr
+	}
+	return answer.String(), nil
+}
+
+// finishTurn writes the turn's single assistant message and clears the
+// checkpoint that was standing in for it.
+//
+// Called on every exit path that produced text, including the failing ones:
+// a turn that died after saying something still said it.
+func (l *Loop) finishTurn(ctx context.Context, t domain.Turn, answer string) error {
+	if answer == "" {
+		// Nothing was said. Clear any checkpoint so a later reader does not
+		// resurrect a fragment of a turn that produced no answer.
+		if l.Checkpoints != nil {
+			_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
+		}
+		return nil
+	}
+	msg := domain.Message{
+		Role:      domain.RoleAssistant,
+		Content:   answer,
+		CreatedAt: l.Now(),
+	}
+	if err := l.Transcript.Append(ctx, t.SessionID, msg); err != nil {
+		return fmt.Errorf("append assistant message: %w", err)
+	}
+	// D-3. The real message is durable now, so the sidecar is stale. A failed
+	// clear is ignored: it leaves a leftover the supersession rule already
+	// hides, and failing here would trade that for a lost answer.
+	if l.Checkpoints != nil {
+		_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
+	}
+	return nil
 }
 
 // complete runs one provider call, streaming its deltas to the sink.
-func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink) (domain.Message, domain.Usage, error) {
+func (l *Loop) complete(
+	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
+	answersAt time.Time, alreadySaid string,
+) (domain.Message, domain.Usage, error) {
 	ctx, end := l.span(ctx, "provider.complete")
 	var err error
 	defer func() { end(err) }()
 
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
-		Model:    t.Model,
+		Model:    l.modelFor(t),
 		Window:   w,
 		System:   l.System,
 		Tools:    l.Tools.Available(ctx),
@@ -184,21 +269,72 @@ func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sin
 	}
 	defer stream.Close()
 
+	// Seeded with what earlier iterations of this turn already said, so a
+	// checkpoint recovers the whole answer rather than only its last leg.
+	var partial strings.Builder
+	partial.WriteString(alreadySaid)
+	lastCheckpoint := l.Now()
+
+	// Deltas are COALESCED before they reach the sink, and that is not an
+	// optimisation -- it is the difference between working and not.
+	//
+	// A provider emits sub-word tokens ("Be", "le", "za"). Each one that
+	// reaches the client costs a re-render and, in the webapp, a re-parse of
+	// the whole revealed markdown; its reveal driver additionally re-plans on
+	// every content delta, having been written when "picoclaw sends the whole
+	// answer in one frame, so in practice this runs once per turn". Emitting
+	// per token turned one re-plan into hundreds and the reply visibly
+	// rewrote itself as it arrived.
+	//
+	// 50ms is ~20 updates a second: past what anyone perceives as anything but
+	// smooth, and an order of magnitude fewer renders. Reasoning is coarser
+	// still at 1s, because it is NARRATION -- picoclaw emits a frame per
+	// thought, not per token, and this channel is consumed as though that were
+	// true.
+	content := newCoalescer(50*time.Millisecond, l.Now, func(text string) {
+		sink.EmitContent(text)
+	})
+	reasoning := newCoalescer(time.Second, l.Now, func(text string) {
+		sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: text})
+	})
+
 	for {
 		d, nerr := stream.Next(ctx)
 		if errors.Is(nerr, io.EOF) {
 			break
 		}
 		if nerr != nil {
+			// Flush before reporting: whatever arrived is the member's, even
+			// though the turn failed.
+			content.Flush()
+			reasoning.Flush()
 			err = fmt.Errorf("provider stream: %w", nerr)
 			return domain.Message{}, domain.Usage{}, err
 		}
-		// FR-2: content reaches the client as the model produces it.
-		sink.EmitContent(d.Content)
-		if d.Reasoning != "" {
-			sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: d.Reasoning})
+		// FR-2: content reaches the client as the model produces it. The sink
+		// comes FIRST -- D-5: durability must never delay delivery.
+		content.Add(d.Content)
+		reasoning.Add(d.Reasoning)
+		partial.WriteString(d.Content)
+
+		// D-2. On the delta path rather than in a goroutine: an 887us write
+		// every 2s of streaming is 0.04% of that window, so there is nothing
+		// to parallelise and a second writer would need a lock for no gain.
+		if l.Checkpoints != nil && partial.Len() > 0 &&
+			l.Now().Sub(lastCheckpoint) >= l.CheckpointEvery {
+			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionID, answersAt, partial.String()); cerr != nil {
+				// A failed checkpoint must not fail the turn: it costs recovery
+				// of THIS answer, and failing here would cost the answer itself.
+				sink.EmitProgress(domain.Progress{
+					Kind: domain.ProgressPlaceholder,
+					Text: "could not checkpoint this answer: " + cerr.Error(),
+				})
+			}
+			lastCheckpoint = l.Now()
 		}
 	}
+	content.Flush()
+	reasoning.Flush()
 	return stream.Message(), stream.Usage(), nil
 }
 
@@ -271,13 +407,25 @@ func (l *Loop) approve(ctx context.Context, t domain.Turn, call domain.ToolCall,
 	}
 }
 
+// modelFor resolves the model for a turn. See Loop.Model for why the turn's
+// own label is not trusted.
+func (l *Loop) modelFor(t domain.Turn) string {
+	if l.Model != "" {
+		return l.Model
+	}
+	// No configured model: fall back to whatever the turn named, so a
+	// misconfiguration surfaces as the provider's own error naming the bad
+	// value rather than as an empty-model request nobody can attribute.
+	return t.Model
+}
+
 func (l *Loop) span(ctx context.Context, name string, attrs ...domain.Attr) (context.Context, func(error)) {
 	return l.Telemetry.Span(ctx, name, attrs...)
 }
 
 func (l *Loop) recordUsage(ctx context.Context, u domain.Usage, t domain.Turn) {
 	l.Telemetry.Usage(ctx, u,
-		domain.Attr{Key: "session.id", Value: t.SessionID},
-		domain.Attr{Key: "model", Value: t.Model},
+		domain.Attr{Key: "conversation.id", Value: string(t.SessionID)},
+		domain.Attr{Key: "model", Value: l.modelFor(t)},
 	)
 }

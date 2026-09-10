@@ -100,7 +100,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	defer stop()
 
 	turn := domain.Turn{
-		SessionID:  req.sessionID(r),
+		SessionID:  domain.ConversationID(req.sessionID(r)),
 		SessionKey: domain.SessionKey(req.sessionKey(r)),
 		Model:      req.Model,
 		Input:      domain.Message{Role: domain.RoleUser, Content: last},
