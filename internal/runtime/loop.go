@@ -1,0 +1,283 @@
+// Package runtime holds the agent loop. It imports the domain and nothing else.
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
+)
+
+// Defaults applied by withDefaults when a field is left zero.
+const (
+	DefaultMaxIterations     = 12
+	DefaultApprovalTimeout   = 5 * time.Minute
+	DefaultApprovalHeartbeat = 10 * time.Second
+	DefaultWindowBudget      = 40
+)
+
+// ErrMaxIterations is returned inside the turn's report when the loop stopped
+// because it hit the cap. It is not returned as the function's error: the turn
+// produced work, and throwing that away to report a limit is the failure mode
+// picoclaw had -- a session that ended at max_tool_iterations with no answer at
+// all, discoverable only from a summary written afterwards.
+var ErrMaxIterations = errors.New("iteration cap reached before the agent finished")
+
+// Loop runs one conversational turn against the five ports.
+//
+// Telemetry and Approver may be left unset: they default to no-op values (see
+// noop.go). Every other port is required.
+type Loop struct {
+	Provider   domain.Provider
+	Transcript domain.TranscriptStore
+	Context    domain.ContextStore
+	Tools      domain.ToolExecutor
+	Approver   domain.Approver
+	Telemetry  domain.Telemetry
+
+	System            string
+	MaxIterations     int
+	ApprovalTimeout   time.Duration
+	ApprovalHeartbeat time.Duration
+	WindowBudget      int
+
+	// Now is injectable so tests do not sleep.
+	Now func() time.Time
+}
+
+func (l *Loop) withDefaults() *Loop {
+	c := *l
+	if c.MaxIterations <= 0 {
+		c.MaxIterations = DefaultMaxIterations
+	}
+	if c.ApprovalTimeout <= 0 {
+		c.ApprovalTimeout = DefaultApprovalTimeout
+	}
+	if c.ApprovalHeartbeat <= 0 {
+		c.ApprovalHeartbeat = DefaultApprovalHeartbeat
+	}
+	if c.WindowBudget <= 0 {
+		c.WindowBudget = DefaultWindowBudget
+	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	if c.Approver == nil {
+		c.Approver = allowAll{}
+	}
+	if c.Telemetry == nil {
+		c.Telemetry = noTelemetry{}
+	}
+	return &c
+}
+
+// Run answers one turn, streaming content to sink as it arrives, and returns
+// the complete answer.
+func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string, error) {
+	c := l.withDefaults()
+
+	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "session.id", Value: t.SessionID})
+	var runErr error
+	defer func() { end(runErr) }()
+
+	// The member's message is durable BEFORE the model is called. A crash
+	// mid-turn must lose the answer, never the question.
+	in := t.Input
+	in.Role = domain.RoleUser
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = c.Now()
+	}
+	if runErr = c.Transcript.Append(ctx, t.SessionKey, in); runErr != nil {
+		return "", fmt.Errorf("append user message: %w", runErr)
+	}
+
+	window, err := c.Context.Load(ctx, t.SessionKey)
+	if err != nil {
+		runErr = fmt.Errorf("load context: %w", err)
+		return "", runErr
+	}
+	window.Messages = append(window.Messages, in)
+
+	var answer string
+	var total domain.Usage
+
+	for i := 0; i < c.MaxIterations; i++ {
+		msg, usage, err := c.complete(ctx, t, window, sink)
+		if err != nil {
+			runErr = err
+			sink.EmitError(err.Error())
+			return answer, runErr
+		}
+		total.Add(usage)
+
+		msg.CreatedAt = c.Now()
+		if err := c.Transcript.Append(ctx, t.SessionKey, msg); err != nil {
+			runErr = fmt.Errorf("append assistant message: %w", err)
+			return answer, runErr
+		}
+		window.Messages = append(window.Messages, msg)
+		if msg.Content != "" {
+			answer = msg.Content
+		}
+
+		if len(msg.ToolCalls) == 0 {
+			c.recordUsage(ctx, total, t)
+			window = compact(window, c.WindowBudget)
+			runErr = c.Context.Save(ctx, t.SessionKey, window)
+			return answer, runErr
+		}
+
+		for _, call := range msg.ToolCalls {
+			res, err := c.runTool(ctx, t, call, sink)
+			if err != nil {
+				runErr = err
+				sink.EmitError(err.Error())
+				return answer, runErr
+			}
+			out := domain.Message{
+				Role:       domain.RoleTool,
+				Content:    res.Content,
+				ToolCallID: call.ID,
+				CreatedAt:  c.Now(),
+			}
+			if err := c.Transcript.Append(ctx, t.SessionKey, out); err != nil {
+				runErr = fmt.Errorf("append tool result: %w", err)
+				return answer, runErr
+			}
+			window.Messages = append(window.Messages, out)
+		}
+
+		window = compact(window, c.WindowBudget)
+		if err := c.Context.Save(ctx, t.SessionKey, window); err != nil {
+			runErr = fmt.Errorf("save context: %w", err)
+			return answer, runErr
+		}
+	}
+
+	// FR-5: hitting the cap must be said out loud, not inferred later.
+	c.recordUsage(ctx, total, t)
+	sink.EmitError(ErrMaxIterations.Error())
+	if saveErr := c.Context.Save(ctx, t.SessionKey, compact(window, c.WindowBudget)); saveErr != nil {
+		return answer, saveErr
+	}
+	return answer, nil
+}
+
+// complete runs one provider call, streaming its deltas to the sink.
+func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink) (domain.Message, domain.Usage, error) {
+	ctx, end := l.span(ctx, "provider.complete")
+	var err error
+	defer func() { end(err) }()
+
+	stream, err := l.Provider.Complete(ctx, domain.Completion{
+		Model:    t.Model,
+		Window:   w,
+		System:   l.System,
+		Tools:    l.Tools.Available(ctx),
+		Messages: w.Messages,
+	})
+	if err != nil {
+		return domain.Message{}, domain.Usage{}, fmt.Errorf("provider: %w", err)
+	}
+	defer stream.Close()
+
+	for {
+		d, nerr := stream.Next(ctx)
+		if errors.Is(nerr, io.EOF) {
+			break
+		}
+		if nerr != nil {
+			err = fmt.Errorf("provider stream: %w", nerr)
+			return domain.Message{}, domain.Usage{}, err
+		}
+		// FR-2: content reaches the client as the model produces it.
+		sink.EmitContent(d.Content)
+		if d.Reasoning != "" {
+			sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: d.Reasoning})
+		}
+	}
+	return stream.Message(), stream.Usage(), nil
+}
+
+// runTool asks the Approver, then invokes -- or turns a refusal into a Result.
+func (l *Loop) runTool(ctx context.Context, t domain.Turn, call domain.ToolCall, sink domain.Sink) (domain.Result, error) {
+	ctx, end := l.span(ctx, "tool.invoke", domain.Attr{Key: "tool.name", Value: call.Name})
+	var err error
+	defer func() { end(err) }()
+
+	sink.EmitProgress(domain.Progress{Kind: domain.ProgressTool, Tool: call.Name})
+
+	dec := l.approve(ctx, t, call, sink)
+	if !dec.Allowed {
+		// DEC-2: a denial is a Result the agent can react to, not a turn failure.
+		return domain.Result{
+			Denied:  true,
+			Content: fmt.Sprintf("The action %q was not approved: %s", call.Name, dec.Reason),
+		}, nil
+	}
+
+	res, err := l.Tools.Invoke(ctx, call)
+	if err != nil {
+		return domain.Result{}, fmt.Errorf("tool %s: %w", call.Name, err)
+	}
+	return res, nil
+}
+
+// approve runs the Approver with a deadline, emitting progress while it waits.
+//
+// DEC-3: an approval can legitimately take minutes, and a silent stream for
+// minutes is the exact failure turn-stream-continuity documents. DEC-4: a
+// timeout denies -- fail closed, and say why.
+func (l *Loop) approve(ctx context.Context, t domain.Turn, call domain.ToolCall, sink domain.Sink) domain.Decision {
+	ctx, cancel := context.WithTimeout(ctx, l.ApprovalTimeout)
+	defer cancel()
+
+	type answer struct {
+		dec domain.Decision
+		err error
+	}
+	ch := make(chan answer, 1)
+	go func() {
+		dec, err := l.Approver.Request(ctx, domain.ActionRequest{
+			SessionKey: t.SessionKey,
+			SessionID:  t.SessionID,
+			Call:       call,
+		})
+		ch <- answer{dec, err}
+	}()
+
+	tick := time.NewTicker(l.ApprovalHeartbeat)
+	defer tick.Stop()
+
+	for {
+		select {
+		case a := <-ch:
+			if a.err != nil {
+				return domain.Decision{Allowed: false, Reason: "approval failed: " + a.err.Error()}
+			}
+			return a.dec
+		case <-tick.C:
+			sink.EmitProgress(domain.Progress{
+				Kind: domain.ProgressPlaceholder,
+				Text: fmt.Sprintf("waiting for approval to run %s", call.Name),
+				Tool: call.Name,
+			})
+		case <-ctx.Done():
+			return domain.Decision{Allowed: false, Reason: "no answer from an approver in time"}
+		}
+	}
+}
+
+func (l *Loop) span(ctx context.Context, name string, attrs ...domain.Attr) (context.Context, func(error)) {
+	return l.Telemetry.Span(ctx, name, attrs...)
+}
+
+func (l *Loop) recordUsage(ctx context.Context, u domain.Usage, t domain.Turn) {
+	l.Telemetry.Usage(ctx, u,
+		domain.Attr{Key: "session.id", Value: t.SessionID},
+		domain.Attr{Key: "model", Value: t.Model},
+	)
+}

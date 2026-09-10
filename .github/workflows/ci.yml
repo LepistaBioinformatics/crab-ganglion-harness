@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: gofmt -l . | tee /dev/stderr | (! read)
+      - run: go vet ./...
+      # -race matters here specifically: the SSE writer has two writers by
+      # construction (the turn and the heartbeat), and interleaved output would
+      # corrupt a frame the client is mid-parse on.
+      - run: go test -race ./...
+      - run: go build ./...
