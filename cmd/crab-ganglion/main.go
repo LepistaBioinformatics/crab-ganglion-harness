@@ -23,6 +23,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/httpsse"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/openai"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/skills"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/jsonl"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/window"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
@@ -111,11 +112,21 @@ func main() {
 		Transcript: transcript,
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
-		Checkpoints:     transcript,
-		Context:         window.New(filepath.Join(workspace, "windows")),
-		Tools:           tool.NewRegistry(tools(workspace, self, reg, logger)...),
-		Model:           cfg.Model,
-		System:          systemPrompt(cfg, logger),
+		Checkpoints: transcript,
+		Context:     window.New(filepath.Join(workspace, "windows")),
+		Tools:       tool.NewRegistry(tools(workspace, self, reg, logger)...),
+		Model:       cfg.Model,
+		System:      systemPrompt(cfg, logger),
+		Prompt: &skills.Prompt{
+			PersonaFile: cfg.SystemFile,
+			Persona:     cfg.System,
+			Loader: skills.Loader{
+				Workspace:  workspace,
+				SharedRoot: cfg.SkillsRoot,
+				Logf:       logger.Printf,
+			},
+			Logf: logger.Printf,
+		},
 		MaxIterations:   cfg.MaxTurnIter,
 		ApprovalTimeout: cfg.ApprovalTimeout,
 	}

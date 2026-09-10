@@ -64,7 +64,11 @@ type Loop struct {
 	// Models is the candidate chain for a turn. Nil means the single Model
 	// above, which is what every deployment did before the registry existed
 	// and what one configured entirely from the environment still does.
-	Models            domain.ModelChain
+	Models domain.ModelChain
+
+	// Prompt assembles the system message. Nil means the static System below,
+	// which is what a deployment with no skills and no persona file uses.
+	Prompt            domain.SystemPrompt
 	System            string
 	MaxIterations     int
 	ApprovalTimeout   time.Duration
@@ -345,6 +349,21 @@ func (l *Loop) tryChain(
 	return domain.Message{}, domain.Usage{}, lastErr
 }
 
+// systemFor assembles the system message for one provider call.
+//
+// Falls back to the static string rather than to nothing: a Prompt that returns
+// "" because a file went missing must not silently strip an agent's identity
+// mid-conversation, which is the failure a persona bind that never existed
+// already caused once.
+func (l *Loop) systemFor(ctx context.Context) string {
+	if l.Prompt != nil {
+		if s := l.Prompt.System(ctx); s != "" {
+			return s
+		}
+	}
+	return l.System
+}
+
 // modelsFor resolves the ordered candidates for a turn, falling back to the
 // single configured model when no registry is wired.
 //
@@ -423,7 +442,7 @@ func (l *Loop) complete(
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
 		Model:    model,
 		Window:   w,
-		System:   l.System,
+		System:   l.systemFor(ctx),
 		Tools:    l.Tools.Available(ctx),
 		Messages: w.Messages,
 	})

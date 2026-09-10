@@ -31,6 +31,16 @@ type ModelChain interface {
 	Chain(turnModel string, kind ModelKind) []string
 }
 
+// SystemPrompt assembles the system message for one turn.
+//
+// A port rather than a string on the loop because what it contains changes while
+// the process runs: the persona file an admin edits, and the skills an
+// administrator or the agent itself adds. Asked once per provider call, so a
+// turn's every iteration sees one coherent prompt.
+type SystemPrompt interface {
+	System(ctx context.Context) string
+}
+
 // ModelKind is what a completion is FOR.
 type ModelKind string
 

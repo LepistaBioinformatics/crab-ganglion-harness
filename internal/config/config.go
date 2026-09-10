@@ -42,8 +42,13 @@ type Config struct {
 	KeyFile       string
 	System        string
 	SystemFile    string
-	DataDir       string
-	MaxTurnIter   int
+	// SkillsRoot is the ADMIN's shared skills directory, mounted read-only by
+	// crab-shell-proxy. Empty means none is bound, which is every container
+	// that has not been recreated since the mount was added -- and the agent's
+	// own <workspace>/skills still loads either way.
+	SkillsRoot  string
+	DataDir     string
+	MaxTurnIter int
 
 	ApprovalEndpoint string
 	ApprovalTimeout  time.Duration
@@ -68,6 +73,7 @@ func Load() (Config, error) {
 		ConfigFile:       env("GANGLION_CONFIG_FILE", DefaultConfigFile),
 		System:           os.Getenv("GANGLION_SYSTEM"),
 		SystemFile:       os.Getenv("GANGLION_SYSTEM_FILE"),
+		SkillsRoot:       os.Getenv("GANGLION_SKILLS_ROOT"),
 		DataDir:          env("GANGLION_DATA_DIR", "/data/.ganglion"),
 		MaxTurnIter:      envInt("GANGLION_MAX_ITERATIONS", 12),
 		ApprovalEndpoint: os.Getenv("GANGLION_APPROVAL_ENDPOINT"),
