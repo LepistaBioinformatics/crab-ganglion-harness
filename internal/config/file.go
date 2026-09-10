@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/secret"
 )
@@ -132,6 +133,17 @@ type file struct {
 
 	Agents struct {
 		Defaults struct {
+			// Subturn is picoclaw's own agents.defaults.subturn block
+			// (pkg/config/config.go:408-414). The first three keys are
+			// picoclaw's, spelled the same; the last two have no picoclaw
+			// equivalent and are named to sit beside them.
+			Subturn *struct {
+				MaxDepth              *int `json:"max_depth"`
+				MaxConcurrent         *int `json:"max_concurrent"`
+				DefaultTimeoutMinutes *int `json:"default_timeout_minutes"`
+				MaxChildIterations    *int `json:"max_child_iterations"`
+				MaxChildrenPerTurn    *int `json:"max_children_per_turn"`
+			} `json:"subturn"`
 			ModelName      string   `json:"model_name"`
 			ModelFallbacks []string `json:"model_fallbacks"`
 			// image_model and image_model_fallbacks are picoclaw's own keys
@@ -166,6 +178,12 @@ type file struct {
 		// read by name without this struct having to enumerate them. Adding a
 		// provider is then a file in the websearch adapter, not an edit here.
 		Web json.RawMessage `json:"web"`
+		// Subagent is picoclaw's own tools.subagent block. Only `enabled` is
+		// read: picoclaw's tools.spawn and tools.spawn_status govern two tools
+		// this harness deliberately does not have.
+		Subagent *struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"subagent"`
 	} `json:"tools"`
 }
 
@@ -245,6 +263,8 @@ type Registry struct {
 	Web Web
 	// Evolution is the evolution block, with picoclaw's defaults applied.
 	Evolution Evolution
+	// Subturn is the sub-agent fan-out block, with defaults applied.
+	Subturn Subturn
 	// Warnings are operator mistakes that are not errors: a key whose value
 	// could not be read, where refusing to boot would be worse than carrying
 	// on without it. Carried out rather than logged here because this package
@@ -322,6 +342,54 @@ const (
 	// absent tool because it looks like success.
 	KindImageGen Kind = "image"
 )
+
+// Subturn bounds sub-agent fan-out.
+//
+// The defaults are picoclaw's where picoclaw has one, with ONE deliberate
+// difference: MaxDepth is 1 rather than 3.
+//
+// At depth 1 a child cannot itself dispatch, which is what keeps the worst case
+// small enough to write down -- MaxIterations + MaxChildrenPerTurn *
+// MaxChildIterations, or 108 model calls at these numbers. Raising it multiplies
+// that per level, which is a decision for an operator who has read this comment.
+//
+// MaxConcurrent keeps picoclaw's 5, and unlike picoclaw's it is enforced at
+// depth 0: there, concurrencySem is nil (newTurnState sets it only for child
+// turns), so first-level fan-out is uncapped and the cap bites only one level
+// down, where it hardly matters.
+type Subturn struct {
+	Enabled            bool
+	MaxDepth           int
+	MaxConcurrent      int
+	Timeout            time.Duration
+	MaxChildIterations int
+	MaxChildrenPerTurn int
+}
+
+// The subturn defaults.
+const (
+	DefaultSubMaxDepth        = 1
+	DefaultSubMaxConcurrent   = 5
+	DefaultSubTimeoutMinutes  = 5
+	DefaultSubChildIterations = 6
+	DefaultSubChildrenPerTurn = 16
+)
+
+// DefaultSubturn is the block a deployment gets when it has no config file at
+// all -- which is every container that has not been recreated since the harness
+// grew one. Exported because the composition root builds a synthetic registry
+// on exactly that path, and a zero Subturn there would mean max_depth 0 and
+// max_concurrent 0: sub-agents silently switched off by a struct literal.
+func DefaultSubturn() Subturn {
+	return Subturn{
+		Enabled:            true,
+		MaxDepth:           DefaultSubMaxDepth,
+		MaxConcurrent:      DefaultSubMaxConcurrent,
+		Timeout:            DefaultSubTimeoutMinutes * time.Minute,
+		MaxChildIterations: DefaultSubChildIterations,
+		MaxChildrenPerTurn: DefaultSubChildrenPerTurn,
+	}
+}
 
 // Reasoning depth.
 //
@@ -438,7 +506,7 @@ func (r Registry) Chain(turnModel string, kind Kind) []string {
 func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) (Registry, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return Registry{}, nil
+		return Registry{Subturn: DefaultSubturn()}, nil
 	}
 	if err != nil {
 		return Registry{}, fmt.Errorf("read %s: %w", path, err)
@@ -501,6 +569,7 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 	}
 
 	reg.Evolution = loadEvolution(f.Evolution)
+	reg.Subturn = loadSubturn(f)
 	reg.Vision = f.Agents.Defaults.ImageModel
 	reg.VisionFalls = f.Agents.Defaults.ImageModelFallbacks
 	reg.ImageGen = f.Agents.Defaults.ImageGenModel
@@ -667,4 +736,36 @@ func loadEvolution(raw *struct {
 		e.MinSuccessRatio = *raw.MinSuccessRatio
 	}
 	return e
+}
+
+// loadSubturn applies the defaults, then whatever the file overrides.
+//
+// Every key is a pointer in the file struct, so "absent" and "present but zero"
+// stay distinguishable: max_concurrent: 0 is an operator saying "run nothing",
+// and reading it as "use the default of 5" would be the opposite instruction.
+func loadSubturn(f file) Subturn {
+	st := DefaultSubturn()
+	if sa := f.Tools.Subagent; sa != nil && sa.Enabled != nil {
+		st.Enabled = *sa.Enabled
+	}
+	c := f.Agents.Defaults.Subturn
+	if c == nil {
+		return st
+	}
+	if c.MaxDepth != nil {
+		st.MaxDepth = *c.MaxDepth
+	}
+	if c.MaxConcurrent != nil {
+		st.MaxConcurrent = *c.MaxConcurrent
+	}
+	if c.DefaultTimeoutMinutes != nil {
+		st.Timeout = time.Duration(*c.DefaultTimeoutMinutes) * time.Minute
+	}
+	if c.MaxChildIterations != nil {
+		st.MaxChildIterations = *c.MaxChildIterations
+	}
+	if c.MaxChildrenPerTurn != nil {
+		st.MaxChildrenPerTurn = *c.MaxChildrenPerTurn
+	}
+	return st
 }

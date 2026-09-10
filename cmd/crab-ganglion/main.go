@@ -33,6 +33,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/loadimage"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/subagents"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/thinking"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
@@ -121,7 +122,6 @@ func main() {
 		// only ever sees the narrow interface for each job.
 		Checkpoints: transcript,
 		Context:     window.New(filepath.Join(workspace, "windows")),
-		Tools:       tool.NewRegistry(tools(workspace, self, reg, logger)...),
 		Model:       cfg.Model,
 		System:      systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{
@@ -136,7 +136,15 @@ func main() {
 		},
 		MaxIterations:   cfg.MaxTurnIter,
 		ApprovalTimeout: cfg.ApprovalTimeout,
+		MaxChildren:     reg.Subturn.MaxChildrenPerTurn,
 	}
+
+	// Tools are assigned AFTER the loop exists, because one of them dispatches
+	// child turns and therefore needs the loop that would run them. The child
+	// runner holds a POINTER, so by the time a child is actually started the
+	// tool set below is in place -- including, at depths under the cap, the
+	// dispatcher itself.
+	loop.Tools = tool.NewRegistry(tools(workspace, self, reg, subAgent(loop, reg), logger)...)
 	// FR-10. Unset endpoint means the exporter posts nothing, so a deployment
 	// without a collector behaves exactly as before rather than logging a
 	// failed request per turn.
@@ -239,6 +247,12 @@ func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) 
 				APIKey:  cfg.APIKey,
 				Enabled: true,
 			}},
+			// Carried explicitly. A zero Subturn here would mean max_depth 0
+			// and max_concurrent 0 -- sub-agents switched off by a struct
+			// literal, on the path every container that predates the config
+			// file takes.
+			Subturn: config.DefaultSubturn(),
+			Web:     reg.Web,
 		}
 		path = ""
 	}
@@ -279,7 +293,28 @@ func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) 
 // conversation, and a conversation that has already been offered a capability
 // should not silently lose it -- a container recreate is the honest way to
 // change the tool set, and the proxy already recreates on a bind change.
-func tools(workspace, self string, reg config.Registry, logger *log.Logger) []tool.Tool {
+// subAgent builds the child runner, or nil when sub-agents are switched off.
+//
+// Nil is what makes the dispatcher absent from the tool list rather than
+// present and refusing.
+func subAgent(loop *runtime.Loop, reg config.Registry) domain.SubAgent {
+	st := reg.Subturn
+	if !st.Enabled || st.MaxChildrenPerTurn <= 0 || st.MaxChildIterations <= 0 {
+		return nil
+	}
+	return &runtime.Child{
+		Parent:        loop,
+		MaxIterations: st.MaxChildIterations,
+		Timeout:       st.Timeout,
+		MaxDepth:      st.MaxDepth,
+		// Withheld from a child that has reached the cap. Both, because
+		// `research` is a caller of the same dispatcher and would otherwise be
+		// a way around the depth limit.
+		HideAtDepth: []string{subagents.Name, subagents.ResearchName},
+	}
+}
+
+func tools(workspace, self string, reg config.Registry, child domain.SubAgent, logger *log.Logger) []tool.Tool {
 	// load_image is unconditional: an image in the workspace is something any
 	// deployment can have, and the tool costs nothing when none is there. What
 	// varies is whether a model can SEE the result, which the vision chain
@@ -301,6 +336,19 @@ func tools(workspace, self string, reg config.Registry, logger *log.Logger) []to
 	if g := imagegen.New(reg, workspace, nil, logger.Printf); g != nil {
 		out = append(out, g)
 		logger.Printf("tools: generate_image enabled")
+	}
+	if d := subagents.New(child, reg.Subturn.MaxConcurrent, 0, 0); d != nil {
+		out = append(out, d)
+		logger.Printf("tools: subagents enabled (max_depth %d, max_concurrent %d, %d children per turn, %d iterations each)",
+			reg.Subturn.MaxDepth, reg.Subturn.MaxConcurrent,
+			reg.Subturn.MaxChildrenPerTurn, reg.Subturn.MaxChildIterations)
+		// research needs BOTH a dispatcher and a search provider. Without
+		// search it is a model asked to recall, which is the failure it exists
+		// to replace.
+		if r := subagents.NewResearch(d, reg.Web.Enabled()); r != nil {
+			out = append(out, r)
+			logger.Printf("tools: research enabled")
+		}
 	}
 	return out
 }

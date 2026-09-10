@@ -169,6 +169,42 @@ type ToolExecutor interface {
 //
 // The harness never resolves WHO may approve -- it asks, and the proxy answers,
 // because that is where mycelium's account id already lands (DEC-1).
+// SubAgent runs one child turn to completion and reports what it concluded.
+//
+// A PORT rather than a call into the runtime, so the dispatcher tool holds an
+// interface and the composition root supplies the implementation -- the same
+// shape ToolExecutor already has. A tool that imported internal/runtime would
+// pass arch_test (runtime is not an adapter) and still invert the hexagon.
+type SubAgent interface {
+	Run(ctx context.Context, task SubTask) SubReport
+}
+
+// SubTask is everything a child is told.
+//
+// It is deliberately small. A child inherits the system prompt, the workspace,
+// the model chain and the tool set, and inherits NO conversation -- so Task is
+// the whole of what it knows about why it exists, and the dispatcher's schema
+// says so in the description the model reads.
+type SubTask struct {
+	Label string
+	Task  string
+	// Context carries the earlier children's answers in sequential mode, and is
+	// empty in parallel mode. It is what makes the two modes different: without
+	// it, sequential would merely be parallel run slowly.
+	Context string
+}
+
+// SubReport is what came back. Err is a FIELD rather than a second return
+// value: one child failing is data about that child, not a failure of the call
+// that ran it.
+type SubReport struct {
+	Label      string
+	Answer     string
+	Iterations int
+	Usage      Usage
+	Err        error
+}
+
 type Approver interface {
 	Request(ctx context.Context, a ActionRequest) (Decision, error)
 }

@@ -17,7 +17,11 @@ const (
 	DefaultMaxIterations     = 12
 	DefaultApprovalTimeout   = 5 * time.Minute
 	DefaultApprovalHeartbeat = 10 * time.Second
-	DefaultWindowBudget      = 40
+	// DefaultMaxChildren is the whole-turn child budget. With
+	// DefaultMaxIterations and a child cap of six, this is what makes the worst
+	// case a number somebody wrote down: 12 + 16*6 = 108 model calls.
+	DefaultMaxChildren  = 16
+	DefaultWindowBudget = 40
 	// DefaultCheckpointEvery is a WALL CLOCK, not a token count: a fast stream
 	// must not checkpoint per token, and a slow one must still checkpoint.
 	DefaultCheckpointEvery = 2 * time.Second
@@ -84,7 +88,11 @@ type Loop struct {
 	ApprovalTimeout   time.Duration
 	ApprovalHeartbeat time.Duration
 	WindowBudget      int
-	CheckpointEvery   time.Duration
+	// MaxChildren bounds the child turns ONE member turn may start, across the
+	// whole tree beneath it. Zero disables sub-agents by starvation, which is
+	// why the dispatcher tool is also gated at boot rather than relying on it.
+	MaxChildren     int
+	CheckpointEvery time.Duration
 
 	// Now is injectable so tests do not sleep.
 	Now func() time.Time
@@ -106,6 +114,9 @@ func (l *Loop) withDefaults() *Loop {
 	}
 	if c.CheckpointEvery <= 0 {
 		c.CheckpointEvery = DefaultCheckpointEvery
+	}
+	if c.MaxChildren <= 0 {
+		c.MaxChildren = DefaultMaxChildren
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -133,6 +144,14 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// agent decided was hard does not silently bill every question after it.
 	depth := &domain.Depth{}
 	ctx = domain.WithDepth(ctx, depth)
+	// The turn's child budget, created ONCE and shared by everything beneath
+	// it. A child runs this same function, so creating one unconditionally
+	// would hand every child a full budget and make the whole-turn bound a
+	// per-child bound -- which is the shape picoclaw's uncapped depth-0
+	// semaphore ends up with, by a different route.
+	if domain.FanoutFrom(ctx) == nil {
+		ctx = domain.WithFanout(ctx, domain.NewFanout(c.MaxChildren))
+	}
 
 	// The member's message is durable BEFORE the model is called. A crash
 	// mid-turn must lose the answer, never the question.
@@ -622,6 +641,11 @@ func (l *Loop) runTool(ctx context.Context, t domain.Turn, call domain.ToolCall,
 	defer func() { end(err) }()
 
 	sink.EmitProgress(domain.Progress{Kind: domain.ProgressTool, Tool: call.Name})
+	// The sink, reachable from inside the tool. Only one tool asks for it -- the
+	// dispatcher, which is the only one that can run for minutes -- and it
+	// serialises its own emissions, because Sink is a struct of plain funcs with
+	// no mutex.
+	ctx = domain.WithSink(ctx, sink)
 
 	dec := l.approve(ctx, t, call, sink)
 	if !dec.Allowed {
