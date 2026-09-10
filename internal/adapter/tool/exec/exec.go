@@ -152,7 +152,15 @@ func (t *Tool) command(ctx context.Context, shell, script string) *osexec.Cmd {
 	} else {
 		cmd = osexec.CommandContext(ctx, t.Self, SandboxArg, t.Workdir, shell, "-c", script)
 	}
-	cmd.Dir = t.Workdir
+	// The COMMAND starts in the project's own files directory, while the
+	// SANDBOX ROOT above stays the whole workspace.
+	//
+	// Deliberately not narrowed: the shared skills the proxy mounts and the
+	// scratch directory below both live at the workspace root, and a Landlock
+	// domain confined to one project would take both away. Isolation between a
+	// member's own projects is a convention here, not a kernel boundary, and
+	// the spec says so where it is claimed.
+	cmd.Dir = t.projectDir(ctx)
 	cmd.Env = scrubEnv(os.Environ())
 
 	// Scratch space inside the workspace rather than a second writable
@@ -207,4 +215,26 @@ func scrubEnv(environ []string) []string {
 		out = append(out, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	return out
+}
+
+// projectDir is where a command starts.
+//
+// Created here rather than assumed: the proxy seeds a project's tree on every
+// ensure, but a scale-to-zero container can take a turn for a project created
+// while it was stopped, and a shell that starts in a directory that does not
+// exist fails with an error about neither.
+func (t *Tool) projectDir(ctx context.Context) string {
+	root := domain.ProjectRoot(ctx, t.Workdir)
+	if root == t.Workdir {
+		return t.Workdir
+	}
+	// The PROJECT ROOT, not a files/ child of it. The main workspace's shell
+	// starts where uploads/, media/ and sessions/ are children; a project's
+	// must too, or the same instruction ("read uploads/report.csv") means two
+	// different paths depending on where the member happens to be. The proxy
+	// writes a project's uploads under this directory for the same reason.
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return t.Workdir
+	}
+	return root
 }

@@ -26,6 +26,14 @@ type Turn struct {
 	SessionKey SessionKey
 	// Model is the model label for this turn.
 	Model string
+	// Project scopes the turn to one of the member's projects: its own files,
+	// its own transcripts, its own window and its own MEMORY.md. Empty means
+	// the main workspace and the behaviour this harness has always had.
+	//
+	// It comes from a header the proxy sets and is never derived here -- the
+	// proxy owns the preimage, and computing it twice is how two components
+	// silently disagree.
+	Project string
 	// Input is the member's message.
 	Input Message
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
 
 // AC-1. The two secrets that were readable on the live gamma container must
@@ -318,5 +319,28 @@ func TestACommandCannotReadTheModelRegistryFile(t *testing.T) {
 	out := run(t, tool, "echo tampered > "+configPath+" ; cat "+configPath)
 	if strings.Contains(out, "tampered") {
 		t.Errorf("a command rewrote the model registry file:\n%s", out)
+	}
+}
+
+// A project shell starts at the PROJECT ROOT, where uploads/, media/ and the
+// rest are children -- exactly as the main workspace's shell starts where its
+// own are. If it started one level deeper, the same instruction ("read
+// uploads/report.csv") would mean two different paths depending on which
+// project the member was in.
+func TestAProjectShellStartsAtTheProjectRoot(t *testing.T) {
+	ws := t.TempDir()
+	tool := &Tool{Workdir: ws}
+
+	got := tool.projectDir(domain.WithProject(context.Background(), "seed-trial"))
+	want := filepath.Join(ws, domain.ProjectsDirName, "seed-trial")
+	if got != want {
+		t.Errorf("cwd = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("the directory was not created: %v", err)
+	}
+	// And a turn with no project starts exactly where it always has.
+	if got := tool.projectDir(context.Background()); got != ws {
+		t.Errorf("unscoped cwd = %q, want the workspace %q", got, ws)
 	}
 }

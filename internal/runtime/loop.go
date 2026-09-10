@@ -142,6 +142,12 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// The turn's reasoning depth, and its whole lifetime. A tool writes it, the
 	// next completion reads it, and it dies with the turn -- so a question the
 	// agent decided was hard does not silently bill every question after it.
+	// The turn's project reaches the stores and the workspace tools through the
+	// context, because their ports take (ctx, id) and (ctx, args) -- widening
+	// either would make every implementation carry a parameter only the
+	// project-aware ones use.
+	ctx = domain.WithProject(ctx, t.Project)
+
 	depth := &domain.Depth{}
 	ctx = domain.WithDepth(ctx, depth)
 	// The turn's child budget, created ONCE and shared by everything beneath

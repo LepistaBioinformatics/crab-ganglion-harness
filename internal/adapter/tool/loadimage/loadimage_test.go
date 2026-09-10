@@ -153,3 +153,60 @@ func TestASubdirectoryOfTheWorkspaceIsAllowed(t *testing.T) {
 		t.Fatalf("a generated image could not be loaded back: %q", res.Content)
 	}
 }
+
+// A project turn resolves a relative path inside its own subtree, so
+// `load_image("photo.png")` in a project finds THAT project's file.
+func TestARelativePathResolvesInsideTheProject(t *testing.T) {
+	ws := t.TempDir()
+	dir := filepath.Join(ws, domain.ProjectsDirName, "seed-trial")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "photo.png"), png, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	args, _ := json.Marshal(map[string]string{"path": "photo.png"})
+	res, err := New(ws).Invoke(domain.WithProject(context.Background(), "seed-trial"), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Attachments) != 1 {
+		t.Fatalf("the project's own file was not found: %q", res.Content)
+	}
+}
+
+// The BOUNDARY is still the workspace, not the project. Separating a member's
+// projects from each other is a convention; claiming it is containment here
+// would make this function assert something it cannot enforce -- the shell tool
+// beside it can walk the whole tree under one Landlock domain.
+func TestTheBoundaryIsStillTheWorkspaceAndNotTheProject(t *testing.T) {
+	ws := t.TempDir()
+	other := filepath.Join(ws, domain.ProjectsDirName, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "shared.png"), png, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	args, _ := json.Marshal(map[string]string{"path": "../other/shared.png"})
+	res, err := New(ws).Invoke(domain.WithProject(context.Background(), "mine"), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Attachments) != 1 {
+		t.Fatalf("a path inside the workspace was refused: %q", res.Content)
+	}
+	// And outside the workspace is still refused, which is the boundary that IS
+	// real.
+	outside := filepath.Join(t.TempDir(), "secret.png")
+	if err := os.WriteFile(outside, png, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args, _ = json.Marshal(map[string]string{"path": outside})
+	res, _ = New(ws).Invoke(domain.WithProject(context.Background(), "mine"), args)
+	if len(res.Attachments) > 0 {
+		t.Error("a path outside the workspace was read")
+	}
+}

@@ -62,14 +62,14 @@ func (t *Tool) Schema() domain.ToolSchema {
 	}
 }
 
-func (t *Tool) Invoke(_ context.Context, raw json.RawMessage) (domain.Result, error) {
+func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, error) {
 	var a struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil {
 		return domain.Result{Content: "load_image: could not read the arguments: " + err.Error()}, nil
 	}
-	path, err := t.resolve(a.Path)
+	path, err := t.resolve(ctx, a.Path)
 	if err != nil {
 		// A refusal is a Result, not an error: the model should be able to try
 		// a different path rather than lose the turn.
@@ -120,14 +120,19 @@ func (t *Tool) Invoke(_ context.Context, raw json.RawMessage) (domain.Result, er
 // confinement here has to be this function, and it works on the RESOLVED path
 // (symlinks followed) rather than on the string, because a symlink inside the
 // workspace pointing at /etc passes every textual check.
-func (t *Tool) resolve(raw string) (string, error) {
+func (t *Tool) resolve(ctx context.Context, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("`path` is required")
 	}
 	p := raw
 	if !filepath.IsAbs(p) {
-		p = filepath.Join(t.workspace, p)
+		// Relative to the PROJECT when there is one, so `load_image("x.png")`
+		// inside a project finds that project's file. The escape check below
+		// still measures against the whole workspace: separating a member's
+		// projects from each other is a convention, and dressing it up as a
+		// boundary here would make this function claim something it cannot do.
+		p = filepath.Join(domain.ProjectRoot(ctx, t.workspace), p)
 	}
 	real, err := filepath.EvalSymlinks(p)
 	if err != nil {
