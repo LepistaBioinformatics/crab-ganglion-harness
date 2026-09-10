@@ -24,15 +24,15 @@ type Store struct {
 
 func New(root string) *Store { return &Store{Root: root} }
 
-func (s *Store) path(key domain.SessionKey) string {
-	return filepath.Join(s.Root, safe(string(key))+".window.json")
+func (s *Store) path(id domain.ConversationID) string {
+	return filepath.Join(s.Root, safe(string(id))+".window.json")
 }
 
-func (s *Store) Load(_ context.Context, key domain.SessionKey) (domain.Window, error) {
+func (s *Store) Load(_ context.Context, id domain.ConversationID) (domain.Window, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	b, err := os.ReadFile(s.path(key))
+	b, err := os.ReadFile(s.path(id))
 	if os.IsNotExist(err) {
 		return domain.Window{}, nil
 	}
@@ -50,7 +50,7 @@ func (s *Store) Load(_ context.Context, key domain.SessionKey) (domain.Window, e
 
 // Save writes atomically. A window truncated by a crash mid-write would be read
 // back as corrupt on the next turn -- survivable, but needlessly.
-func (s *Store) Save(_ context.Context, key domain.SessionKey, w domain.Window) error {
+func (s *Store) Save(_ context.Context, id domain.ConversationID, w domain.Window) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -61,7 +61,7 @@ func (s *Store) Save(_ context.Context, key domain.SessionKey, w domain.Window) 
 	if err != nil {
 		return fmt.Errorf("marshal window: %w", err)
 	}
-	final := s.path(key)
+	final := s.path(id)
 	tmp, err := os.CreateTemp(s.Root, ".window-*")
 	if err != nil {
 		return fmt.Errorf("temp window: %w", err)

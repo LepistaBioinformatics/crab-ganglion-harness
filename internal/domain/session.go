@@ -1,14 +1,27 @@
 package domain
 
-// SessionKey is the stable per-(user, agent) scope. The proxy derives it and the
-// harness only ever carries it -- deriving it here would duplicate a preimage the
-// proxy owns, which is how two components silently disagree.
+// SessionKey is the stable per-(user, agent) scope: long-term memory that spans
+// conversations. The proxy derives it and the harness only ever carries it --
+// deriving it here would duplicate a preimage the proxy owns, which is how two
+// components silently disagree.
+//
+// It is NOT what a transcript is keyed by. Use ConversationID for that.
 type SessionKey string
+
+// ConversationID identifies ONE conversation. Transcripts, context windows and
+// checkpoints are all keyed by it.
+//
+// A distinct type, not a string, because the first cut of this keyed every
+// store by SessionKey -- so every conversation a member had shared a single
+// transcript file, and the proxy, which looks a conversation up by its own id,
+// found nothing and showed an empty history. Two ids of the same underlying
+// shape, one comment apart, and the compiler had nothing to say. Now it does.
+type ConversationID string
 
 // Turn is one inbound request to answer.
 type Turn struct {
-	// SessionID scopes the conversation transcript.
-	SessionID string
+	// SessionID identifies the conversation. Everything durable is keyed by it.
+	SessionID ConversationID
 	// SessionKey scopes long-term memory across conversations.
 	SessionKey SessionKey
 	// Model is the model label for this turn.
@@ -43,8 +56,10 @@ type Completion struct {
 
 // ActionRequest is a proposed tool invocation put to an Approver (FR-7).
 type ActionRequest struct {
+	// SessionKey is the memory scope; SessionID the conversation. An approver
+	// needs both: who is asking, and which conversation to show them.
 	SessionKey SessionKey
-	SessionID  string
+	SessionID  ConversationID
 	Call       ToolCall
 }
 

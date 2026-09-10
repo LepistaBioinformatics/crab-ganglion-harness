@@ -104,7 +104,7 @@ func (l *Loop) withDefaults() *Loop {
 func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string, error) {
 	c := l.withDefaults()
 
-	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "session.id", Value: t.SessionID})
+	ctx, end := c.span(ctx, "turn", domain.Attr{Key: "conversation.id", Value: string(t.SessionID)})
 	var runErr error
 	defer func() { end(runErr) }()
 
@@ -115,11 +115,11 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	if in.CreatedAt.IsZero() {
 		in.CreatedAt = c.Now()
 	}
-	if runErr = c.Transcript.Append(ctx, t.SessionKey, in); runErr != nil {
+	if runErr = c.Transcript.Append(ctx, t.SessionID, in); runErr != nil {
 		return "", fmt.Errorf("append user message: %w", runErr)
 	}
 
-	window, err := c.Context.Load(ctx, t.SessionKey)
+	window, err := c.Context.Load(ctx, t.SessionID)
 	if err != nil {
 		runErr = fmt.Errorf("load context: %w", err)
 		return "", runErr
@@ -139,7 +139,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		total.Add(usage)
 
 		msg.CreatedAt = c.Now()
-		if err := c.Transcript.Append(ctx, t.SessionKey, msg); err != nil {
+		if err := c.Transcript.Append(ctx, t.SessionID, msg); err != nil {
 			runErr = fmt.Errorf("append assistant message: %w", err)
 			return answer, runErr
 		}
@@ -152,7 +152,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		// which the supersession rule already renders invisible. Failing the
 		// turn here would trade a harmless leftover for a lost answer.
 		if c.Checkpoints != nil {
-			_ = c.Checkpoints.ClearPartial(ctx, t.SessionKey)
+			_ = c.Checkpoints.ClearPartial(ctx, t.SessionID)
 		}
 		window.Messages = append(window.Messages, msg)
 		if msg.Content != "" {
@@ -162,7 +162,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		if len(msg.ToolCalls) == 0 {
 			c.recordUsage(ctx, total, t)
 			window = compact(window, c.WindowBudget)
-			runErr = c.Context.Save(ctx, t.SessionKey, window)
+			runErr = c.Context.Save(ctx, t.SessionID, window)
 			return answer, runErr
 		}
 
@@ -179,7 +179,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				ToolCallID: call.ID,
 				CreatedAt:  c.Now(),
 			}
-			if err := c.Transcript.Append(ctx, t.SessionKey, out); err != nil {
+			if err := c.Transcript.Append(ctx, t.SessionID, out); err != nil {
 				runErr = fmt.Errorf("append tool result: %w", err)
 				return answer, runErr
 			}
@@ -187,7 +187,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		}
 
 		window = compact(window, c.WindowBudget)
-		if err := c.Context.Save(ctx, t.SessionKey, window); err != nil {
+		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
 			runErr = fmt.Errorf("save context: %w", err)
 			return answer, runErr
 		}
@@ -196,7 +196,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// FR-5: hitting the cap must be said out loud, not inferred later.
 	c.recordUsage(ctx, total, t)
 	sink.EmitError(ErrMaxIterations.Error())
-	if saveErr := c.Context.Save(ctx, t.SessionKey, compact(window, c.WindowBudget)); saveErr != nil {
+	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
 		return answer, saveErr
 	}
 	return answer, nil
@@ -246,7 +246,7 @@ func (l *Loop) complete(
 		// to parallelise and a second writer would need a lock for no gain.
 		if l.Checkpoints != nil && partial.Len() > 0 &&
 			l.Now().Sub(lastCheckpoint) >= l.CheckpointEvery {
-			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionKey, answersAt, partial.String()); cerr != nil {
+			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionID, answersAt, partial.String()); cerr != nil {
 				// A failed checkpoint must not fail the turn: it costs recovery
 				// of THIS answer, and failing here would cost the answer itself.
 				sink.EmitProgress(domain.Progress{
@@ -347,7 +347,7 @@ func (l *Loop) span(ctx context.Context, name string, attrs ...domain.Attr) (con
 
 func (l *Loop) recordUsage(ctx context.Context, u domain.Usage, t domain.Turn) {
 	l.Telemetry.Usage(ctx, u,
-		domain.Attr{Key: "session.id", Value: t.SessionID},
+		domain.Attr{Key: "conversation.id", Value: string(t.SessionID)},
 		domain.Attr{Key: "model", Value: l.modelFor(t)},
 	)
 }

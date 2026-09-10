@@ -314,12 +314,12 @@ type fakeCheckpoints struct {
 	err     error
 }
 
-func (f *fakeCheckpoints) Checkpoint(_ context.Context, _ domain.SessionKey, _ time.Time, content string) error {
+func (f *fakeCheckpoints) Checkpoint(_ context.Context, _ domain.ConversationID, _ time.Time, content string) error {
 	f.writes = append(f.writes, content)
 	return f.err
 }
 
-func (f *fakeCheckpoints) ClearPartial(context.Context, domain.SessionKey) error {
+func (f *fakeCheckpoints) ClearPartial(context.Context, domain.ConversationID) error {
 	f.cleared++
 	return nil
 }

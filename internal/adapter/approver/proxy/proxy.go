@@ -43,7 +43,7 @@ func (c *Client) Request(ctx context.Context, a domain.ActionRequest) (domain.De
 	}
 	body, err := json.Marshal(wireRequest{
 		SessionKey: string(a.SessionKey),
-		SessionID:  a.SessionID,
+		SessionID:  string(a.SessionID),
 		ToolCallID: a.Call.ID,
 		Tool:       a.Call.Name,
 		Arguments:  a.Call.Args,

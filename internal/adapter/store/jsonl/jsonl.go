@@ -43,13 +43,13 @@ type Store struct {
 
 func New(root string) *Store { return &Store{Root: root} }
 
-func (s *Store) path(key domain.SessionKey) string {
-	return filepath.Join(s.Root, safe(string(key))+".jsonl")
+func (s *Store) path(id domain.ConversationID) string {
+	return filepath.Join(s.Root, safe(string(id))+".jsonl")
 }
 
 // Append adds one message. The write is O(1) in the file's size, which is what
 // makes an append-only transcript affordable for a long conversation.
-func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Message) error {
+func (s *Store) Append(_ context.Context, id domain.ConversationID, m domain.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -60,7 +60,7 @@ func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Messag
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
-	f, err := os.OpenFile(s.path(key), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(s.path(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("open transcript: %w", err)
 	}
@@ -86,8 +86,8 @@ func (s *Store) Append(_ context.Context, key domain.SessionKey, m domain.Messag
 // partials inside the JSONL was the obvious alternative and it fails exactly
 // there -- an older reader would show the same growing answer once per
 // checkpoint.
-func (s *Store) partialPath(key domain.SessionKey) string {
-	return filepath.Join(s.Root, safe(string(key))+".partial.json")
+func (s *Store) partialPath(id domain.ConversationID) string {
+	return filepath.Join(s.Root, safe(string(id))+".partial.json")
 }
 
 // Partial is an answer that was still streaming.
@@ -106,7 +106,7 @@ type Partial struct {
 // Rewriting this file is fine -- it is derived, like the context window. The
 // append-only invariant belongs to the transcript, and the transcript is not
 // this file.
-func (s *Store) Checkpoint(_ context.Context, key domain.SessionKey, answersAt time.Time, content string) error {
+func (s *Store) Checkpoint(_ context.Context, id domain.ConversationID, answersAt time.Time, content string) error {
 	p := Partial{AnswersAt: answersAt, Content: content, UpdatedAt: time.Now()}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,7 +135,7 @@ func (s *Store) Checkpoint(_ context.Context, key domain.SessionKey, answersAt t
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.partialPath(key))
+	return os.Rename(tmp.Name(), s.partialPath(id))
 }
 
 // ClearPartial removes the sidecar. Called after the real message is appended.
@@ -143,10 +143,10 @@ func (s *Store) Checkpoint(_ context.Context, key domain.SessionKey, answersAt t
 // The crash window between that append and this call is exactly what
 // Partial.AnswersAt exists to make harmless: a reader finding both sees an
 // assistant message at or after AnswersAt and ignores the sidecar.
-func (s *Store) ClearPartial(_ context.Context, key domain.SessionKey) error {
+func (s *Store) ClearPartial(_ context.Context, id domain.ConversationID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := os.Remove(s.partialPath(key))
+	err := os.Remove(s.partialPath(id))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -159,8 +159,8 @@ func (s *Store) ClearPartial(_ context.Context, key domain.SessionKey) error {
 // ok is false for "no sidecar" and for "superseded"; both mean a reader has
 // nothing to add, and distinguishing them would invite a caller to treat a
 // stale partial as recoverable.
-func (s *Store) ReadPartial(ctx context.Context, key domain.SessionKey) (Partial, bool, error) {
-	b, err := os.ReadFile(s.partialPath(key))
+func (s *Store) ReadPartial(ctx context.Context, id domain.ConversationID) (Partial, bool, error) {
+	b, err := os.ReadFile(s.partialPath(id))
 	if os.IsNotExist(err) {
 		return Partial{}, false, nil
 	}
@@ -175,7 +175,7 @@ func (s *Store) ReadPartial(ctx context.Context, key domain.SessionKey) (Partial
 		return Partial{}, false, nil
 	}
 
-	msgs, err := s.Read(ctx, key)
+	msgs, err := s.Read(ctx, id)
 	if err != nil {
 		return Partial{}, false, err
 	}
@@ -189,11 +189,11 @@ func (s *Store) ReadPartial(ctx context.Context, key domain.SessionKey) (Partial
 
 // Read returns the whole transcript. A missing file is an empty conversation,
 // not an error -- the first turn of every session reads before it writes.
-func (s *Store) Read(_ context.Context, key domain.SessionKey) ([]domain.Message, error) {
+func (s *Store) Read(_ context.Context, id domain.ConversationID) ([]domain.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.Open(s.path(key))
+	f, err := os.Open(s.path(id))
 	if os.IsNotExist(err) {
 		return []domain.Message{}, nil
 	}
@@ -249,9 +249,9 @@ func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err e
 		if e.IsDir() || !strings.HasSuffix(name, ".partial.json") {
 			continue
 		}
-		key := domain.SessionKey(strings.TrimSuffix(name, ".partial.json"))
+		id := domain.ConversationID(strings.TrimSuffix(name, ".partial.json"))
 
-		p, live, perr := s.ReadPartial(ctx, key)
+		p, live, perr := s.ReadPartial(ctx, id)
 		if perr != nil {
 			// One unreadable sidecar must not stop the others from being
 			// recovered -- this runs at boot, and a boot that fails on a
@@ -259,14 +259,14 @@ func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err e
 			continue
 		}
 		if !live {
-			if s.ClearPartial(ctx, key) == nil {
+			if s.ClearPartial(ctx, id) == nil {
 				dropped++
 			}
 			continue
 		}
 		if strings.TrimSpace(p.Content) == "" {
 			// A checkpoint that caught nothing. Dropping it is not data loss.
-			if s.ClearPartial(ctx, key) == nil {
+			if s.ClearPartial(ctx, id) == nil {
 				dropped++
 			}
 			continue
@@ -279,10 +279,10 @@ func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err e
 			// after messages that came later.
 			CreatedAt: p.UpdatedAt,
 		}
-		if aerr := s.Append(ctx, key, msg); aerr != nil {
+		if aerr := s.Append(ctx, id, msg); aerr != nil {
 			continue // leave the sidecar; the next start tries again
 		}
-		if s.ClearPartial(ctx, key) == nil {
+		if s.ClearPartial(ctx, id) == nil {
 			folded++
 		}
 	}
