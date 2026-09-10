@@ -8,10 +8,13 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/approver/proxy"
@@ -22,17 +25,57 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/runtime"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/secret"
 )
 
 func main() {
+	// BEFORE ANYTHING. In sandbox mode this process is a command the agent
+	// asked for: it applies the Landlock domain and execve's the shell, and
+	// must not read configuration, open the transcript or reach the network
+	// on the way -- every one of those would run unconfined.
+	if len(os.Args) > 1 && os.Args[1] == exec.SandboxArg {
+		if err := exec.RunSandboxed(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "sandbox: %v\n", err)
+			os.Exit(126)
+		}
+		return
+	}
+
 	logger := log.New(os.Stderr, "ganglion ", log.LstdFlags|log.LUTC)
+
+	if len(os.Args) > 1 && os.Args[1] == "encrypt" {
+		if err := encrypt(); err != nil {
+			logger.Fatalf("encrypt: %v", err)
+		}
+		return
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Fatalf("config: %v", err)
+	}
+
+	// Fail CLOSED, and fail at BOOT.
+	//
+	// There is no setting that disables the confinement, so a kernel that
+	// cannot provide one is a deployment that must not serve turns. Checked
+	// here rather than at the first tool call because this stack has repeatedly
+	// paid for the other choice: a missing persona path and three unset
+	// variables all surfaced mid-conversation, as behaviour nobody could
+	// attribute, instead of as one line at startup.
+	abi, err := landlock.ABI()
+	if err != nil {
+		logger.Fatalf("sandbox: %v", err)
+	}
+	logger.Printf("sandbox: landlock ABI %d", abi)
+
+	self, err := os.Executable()
+	if err != nil {
+		logger.Fatalf("sandbox: cannot locate my own binary to re-exec: %v", err)
 	}
 
 	// H-1. Everything lives under the "workspace" segment, because that is where
@@ -56,7 +99,7 @@ func main() {
 		// only ever sees the narrow interface for each job.
 		Checkpoints:     transcript,
 		Context:         window.New(filepath.Join(workspace, "windows")),
-		Tools:           tool.NewRegistry(exec.New(workspace)),
+		Tools:           tool.NewRegistry(shellTool(workspace, self)),
 		Model:           cfg.Model,
 		System:          systemPrompt(cfg, logger),
 		MaxIterations:   cfg.MaxTurnIter,
@@ -81,6 +124,16 @@ func main() {
 	// Recovery runs before the first turn is served. Under scale-to-zero this
 	// start IS the turn after a crash, so an interrupted answer becomes an
 	// ordinary message before the model is asked to continue the conversation.
+	// Housekeeping beside the partial recovery: the sandbox gives commands
+	// their TMPDIR inside the workspace (nothing outside it is writable), and
+	// nothing removes what a command leaves there. Cleared at boot rather than
+	// per turn -- a scale-to-zero agent boots often, and a running one holding
+	// its own scratch for the length of a session is the ordinary behaviour of
+	// a /tmp anyway.
+	if err := os.RemoveAll(filepath.Join(workspace, exec.TmpDirName)); err != nil {
+		logger.Printf("clear the command scratch dir: %v", err)
+	}
+
 	if folded, dropped, err := transcript.RecoverPartials(context.Background()); err != nil {
 		logger.Printf("partial recovery: %v", err)
 	} else if folded > 0 || dropped > 0 {
@@ -114,4 +167,45 @@ func systemPrompt(cfg config.Config, logger *log.Logger) string {
 		return cfg.System
 	}
 	return string(b)
+}
+
+// shellTool is the ONE place the shell tool is constructed, and it always sets
+// Self. There is no branch here and no configuration reaching it: an operator
+// cannot turn the sandbox off, because there is nothing to turn.
+func shellTool(workspace, self string) *exec.Tool {
+	t := exec.New(workspace)
+	t.Self = self
+	return t
+}
+
+// encrypt turns a plaintext on stdin into the enc:// value to paste into the
+// deployment's environment.
+//
+// stdin rather than an argument: an argument is in the shell history, in the
+// process list, and in any terminal recording.
+func encrypt() error {
+	pt, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	plain := strings.TrimRight(string(pt), "\r\n")
+	if plain == "" {
+		return fmt.Errorf("nothing on stdin; pipe the credential in, do not pass it as an argument")
+	}
+	// The two factors read directly, not through config.Load: encrypting a
+	// value must work on a machine that has no model, no provider and no
+	// transcript directory, and Load rightly refuses to return cleanly there.
+	keyFile := os.Getenv("GANGLION_KEY_FILE")
+	if keyFile == "" {
+		keyFile = config.DefaultKeyFile
+	}
+	v, err := secret.Seal(secret.Resolver{
+		Passphrase: os.Getenv("GANGLION_KEY_PASSPHRASE"),
+		KeyFile:    keyFile,
+	}, plain)
+	if err != nil {
+		return err
+	}
+	fmt.Println(v)
+	return nil
 }
