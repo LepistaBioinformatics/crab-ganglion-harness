@@ -31,6 +31,10 @@ type Config struct {
 	Model   string
 	BaseURL string
 	APIKey  string
+	// ConfigFile is the structural half of the configuration: the model
+	// registry and, later, the tool and evolution blocks. See file.go for why
+	// this one thing is not read from the environment.
+	ConfigFile string
 	// KeyPassphrase and KeyFile are the two factors that resolve an enc://
 	// value. They are NOT credentials themselves -- either one alone
 	// decrypts nothing.
@@ -61,6 +65,7 @@ func Load() (Config, error) {
 		APIKey:           os.Getenv("GANGLION_API_KEY"),
 		KeyPassphrase:    os.Getenv("GANGLION_KEY_PASSPHRASE"),
 		KeyFile:          env("GANGLION_KEY_FILE", DefaultKeyFile),
+		ConfigFile:       env("GANGLION_CONFIG_FILE", DefaultConfigFile),
 		System:           os.Getenv("GANGLION_SYSTEM"),
 		SystemFile:       os.Getenv("GANGLION_SYSTEM_FILE"),
 		DataDir:          env("GANGLION_DATA_DIR", "/data/.ganglion"),
@@ -76,11 +81,24 @@ func Load() (Config, error) {
 			}
 		}
 	}
-	if c.BaseURL == "" {
-		return c, fmt.Errorf("GANGLION_BASE_URL is required: there is no provider registry mapping a name to an endpoint")
-	}
-	if c.Model == "" {
-		return c, fmt.Errorf("GANGLION_MODEL is required")
+	// The three variables are required only when nothing else can supply a
+	// model. A deployment that mounts a config file with a model_list has
+	// already answered the question these errors ask, and demanding them
+	// anyway would mean every such deployment carrying a decorative value.
+	//
+	// The check is on the FILE'S EXISTENCE rather than on its contents,
+	// deliberately: parsing happens after enc:// resolution, and a config file
+	// that exists but declares nothing usable must fail as "your registry is
+	// empty", not as "GANGLION_MODEL is required" -- which would send an
+	// operator to fix the wrong thing.
+	if !fileExists(c.ConfigFile) {
+		if c.BaseURL == "" {
+			return c, fmt.Errorf("GANGLION_BASE_URL is required when no config file is mounted at %s: "+
+				"there is no provider registry mapping a name to an endpoint", c.ConfigFile)
+		}
+		if c.Model == "" {
+			return c, fmt.Errorf("GANGLION_MODEL is required when no config file is mounted at %s", c.ConfigFile)
+		}
 	}
 
 	// enc:// values are resolved HERE, at load, so a wrong passphrase is a
@@ -101,6 +119,17 @@ func Load() (Config, error) {
 		*f.p = v
 	}
 	return c, nil
+}
+
+// fileExists reports whether a path is a readable regular file. An unreadable
+// or directory path counts as absent: the caller's next move -- fall back to
+// the environment -- is right in every one of those cases.
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 func env(k, def string) string {

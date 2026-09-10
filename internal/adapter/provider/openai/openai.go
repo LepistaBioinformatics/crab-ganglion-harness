@@ -34,6 +34,22 @@ type Client struct {
 	BaseURL string
 	APIKey  string
 	HTTP    *http.Client
+
+	// ExtraBody is merged into the request object at the TOP LEVEL, which is
+	// where every provider quirk this format needs lives: minimax's
+	// reasoning_split, a vendor's enable_thinking, a routing preference. It is
+	// picoclaw's `extra_body` and carries the same values.
+	//
+	// Merged rather than templated, and merged so that it can never displace a
+	// field this adapter sets: model, stream, messages and tools are the
+	// contract the loop depends on, and a config key that could overwrite
+	// `stream` would turn streaming off from a text box in an admin screen.
+	ExtraBody map[string]json.RawMessage
+
+	// Headers are sent verbatim. Authorization is set after them, so a header
+	// declared here cannot replace the bearer -- a config key that could would
+	// let one model's configuration send another model's key.
+	Headers map[string]string
 }
 
 func New(baseURL, apiKey string, hc *http.Client) *Client {
@@ -43,10 +59,41 @@ func New(baseURL, apiKey string, hc *http.Client) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), APIKey: apiKey, HTTP: hc}
 }
 
-func (c *Client) Complete(ctx context.Context, req domain.Completion) (domain.Stream, error) {
+// reserved names the request fields ExtraBody may not touch. See Client.ExtraBody.
+var reserved = map[string]bool{
+	"model": true, "stream": true, "messages": true, "tools": true, "stream_options": true,
+}
+
+// encode marshals the request and merges ExtraBody over it.
+//
+// Two marshal passes rather than a struct with an inline map, because the
+// merge has to happen at the top level of an object whose other fields are
+// typed -- and encoding/json offers no way to say that.
+func (c *Client) encode(req domain.Completion) ([]byte, error) {
 	body, err := json.Marshal(buildRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	if len(c.ExtraBody) == 0 {
+		return body, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, fmt.Errorf("merge extra_body: %w", err)
+	}
+	for k, v := range c.ExtraBody {
+		if reserved[k] {
+			continue
+		}
+		obj[k] = v
+	}
+	return json.Marshal(obj)
+}
+
+func (c *Client) Complete(ctx context.Context, req domain.Completion) (domain.Stream, error) {
+	body, err := c.encode(req)
+	if err != nil {
+		return nil, err
 	}
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
@@ -54,6 +101,10 @@ func (c *Client) Complete(ctx context.Context, req domain.Completion) (domain.St
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Accept", "text/event-stream")
+	for k, v := range c.Headers {
+		hreq.Header.Set(k, v)
+	}
+	// LAST, so no configured header can replace it.
 	if c.APIKey != "" {
 		hreq.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}

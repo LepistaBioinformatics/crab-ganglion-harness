@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -159,5 +160,97 @@ func TestComplete_RequestsUsageInTheStream(t *testing.T) {
 	}
 	if !strings.Contains(body, `"stream":true`) {
 		t.Errorf("request did not ask to stream: %s", body)
+	}
+}
+
+// captured records the request one Complete call actually put on the wire.
+type captured struct {
+	body    map[string]any
+	headers http.Header
+}
+
+func capture(t *testing.T, mutate func(*Client)) captured {
+	t.Helper()
+	var got captured
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.headers = r.Header.Clone()
+		_ = json.NewDecoder(r.Body).Decode(&got.body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "the-real-key", srv.Client())
+	mutate(c)
+	s, err := c.Complete(context.Background(), domain.Completion{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	return got
+}
+
+// extra_body is how picoclaw carries provider quirks -- minimax's
+// reasoning_split, a vendor's enable_thinking. It has to land at the TOP level
+// of the request object, not nested under a key of its own.
+func TestExtraBodyIsMergedAtTheTopLevel(t *testing.T) {
+	got := capture(t, func(c *Client) {
+		c.ExtraBody = map[string]json.RawMessage{
+			"reasoning_split": json.RawMessage(`true`),
+			"top_p":           json.RawMessage(`0.4`),
+		}
+	})
+	if got.body["reasoning_split"] != true {
+		t.Errorf("reasoning_split = %v, want true at the top level", got.body["reasoning_split"])
+	}
+	if got.body["top_p"] != 0.4 {
+		t.Errorf("top_p = %v, want 0.4", got.body["top_p"])
+	}
+}
+
+// The reserved fields are the contract the loop depends on. A config key that
+// could set `stream: false` would turn streaming off from a text box in an
+// admin screen -- and streaming is FR-2, the capability picoclaw lacks.
+func TestExtraBodyCannotDisplaceTheFieldsTheLoopDependsOn(t *testing.T) {
+	got := capture(t, func(c *Client) {
+		c.ExtraBody = map[string]json.RawMessage{
+			"stream":   json.RawMessage(`false`),
+			"model":    json.RawMessage(`"a-different-model"`),
+			"messages": json.RawMessage(`[]`),
+		}
+	})
+	if got.body["stream"] != true {
+		t.Error("extra_body turned streaming off")
+	}
+	if got.body["model"] != "m" {
+		t.Errorf("model = %v, want m -- extra_body replaced it", got.body["model"])
+	}
+}
+
+// A custom header that could replace Authorization would let one model's
+// configuration send another model's key.
+func TestACustomHeaderCannotReplaceTheBearer(t *testing.T) {
+	got := capture(t, func(c *Client) {
+		c.Headers = map[string]string{
+			"Authorization": "Bearer someone-elses-key",
+			"X-Vendor-Tag":  "kept",
+		}
+	})
+	if h := got.headers.Get("Authorization"); h != "Bearer the-real-key" {
+		t.Errorf("Authorization = %q, want the configured key", h)
+	}
+	if h := got.headers.Get("X-Vendor-Tag"); h != "kept" {
+		t.Errorf("X-Vendor-Tag = %q, want kept -- ordinary headers must still be sent", h)
+	}
+}
+
+// No extra_body must mean no second marshal pass changed anything.
+func TestWithoutExtraBodyTheRequestIsUnchanged(t *testing.T) {
+	got := capture(t, func(*Client) {})
+	if got.body["stream"] != true || got.body["model"] != "m" {
+		t.Fatalf("plain request came out wrong: %v", got.body)
+	}
+	if _, ok := got.body["extra_body"]; ok {
+		t.Error("extra_body leaked into the request as a key of its own")
 	}
 }

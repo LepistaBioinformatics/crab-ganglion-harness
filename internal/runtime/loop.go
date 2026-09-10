@@ -45,20 +45,26 @@ type Loop struct {
 	Approver    domain.Approver
 	Telemetry   domain.Telemetry
 
-	// Model is the model this harness was configured with, and it is what
-	// every turn uses.
+	// Model is the single model this harness was configured with, used when
+	// Models is nil.
 	//
-	// The turn's own Model field is deliberately IGNORED in v1. The proxy fills
-	// it with a placeholder -- literally "picoclaw", the harness name, because
-	// that is what its /v1/models advertises and what a client echoes back --
-	// and forwarding that to a provider gets:
+	// The turn's own Model field is NOT trusted on this path. crab-shell-proxy
+	// fills it with a placeholder -- literally the harness name, because that
+	// is what its /v1/models advertises and what a client echoes back -- and
+	// forwarding that to a provider gets:
 	//
 	//   The supported API model names are deepseek-flash, deepseek-v4-pro,
 	//   but you passed picoclaw.
 	//
-	// Per-turn model selection is DF-4, deferred and answered 501 by the proxy,
-	// so there is nothing to honour yet. When it lands, this is where it goes.
-	Model             string
+	// Models is what honours it safely: a name is used only when the registry
+	// recognises it, so the placeholder resolves to the default chain instead
+	// of reaching an endpoint.
+	Model string
+
+	// Models is the candidate chain for a turn. Nil means the single Model
+	// above, which is what every deployment did before the registry existed
+	// and what one configured entirely from the environment still does.
+	Models            domain.ModelChain
 	System            string
 	MaxIterations     int
 	ApprovalTimeout   time.Duration
@@ -152,7 +158,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	var total domain.Usage
 
 	for i := 0; i < c.MaxIterations; i++ {
-		msg, usage, err := c.complete(ctx, t, window, sink, in.CreatedAt, answer.String())
+		msg, usage, err := c.completeWithFallback(ctx, t, window, sink, in.CreatedAt, answer.String())
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
@@ -248,24 +254,81 @@ func (l *Loop) finishTurn(ctx context.Context, t domain.Turn, answer string) err
 	return nil
 }
 
-// complete runs one provider call, streaming its deltas to the sink.
-func (l *Loop) complete(
+// completeWithFallback walks the turn's candidate models until one answers.
+//
+// THE RULE, and it is the whole of the design: a candidate is abandoned only
+// while NOTHING has reached the member. Once a byte of content has been
+// emitted, the turn is committed to that model and its failure surfaces --
+// restarting under another model would splice two voices into one bubble, and
+// the member has already seen the first half of the first one.
+//
+// The error returned when the chain runs out is the LAST provider's, not a
+// synthetic summary: an operator reading the log needs the reason the final
+// attempt failed, and a wrapper that said "all 3 models failed" would bury it.
+func (l *Loop) completeWithFallback(
 	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
 	answersAt time.Time, alreadySaid string,
 ) (domain.Message, domain.Usage, error) {
-	ctx, end := l.span(ctx, "provider.complete")
+	chain := l.modelsFor(t)
+	var lastErr error
+	for i, model := range chain {
+		msg, usage, emitted, err := l.complete(ctx, t, w, sink, answersAt, alreadySaid, model)
+		if err == nil {
+			return msg, usage, nil
+		}
+		lastErr = err
+		if emitted || i == len(chain)-1 {
+			return domain.Message{}, domain.Usage{}, err
+		}
+		// Said out loud rather than logged: a member watching a turn stall for
+		// eight seconds and then answer is owed the reason, and this is the
+		// same channel the tool narration already uses.
+		sink.EmitProgress(domain.Progress{
+			Kind: domain.ProgressPlaceholder,
+			Text: fmt.Sprintf("%s did not answer (%v); trying %s", model, err, chain[i+1]),
+		})
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no model is configured for this turn")
+	}
+	return domain.Message{}, domain.Usage{}, lastErr
+}
+
+// modelsFor resolves the ordered candidates for a turn, falling back to the
+// single configured model when no registry is wired.
+func (l *Loop) modelsFor(t domain.Turn) []string {
+	if l.Models != nil {
+		if chain := l.Models.Chain(t.Model); len(chain) > 0 {
+			return chain
+		}
+	}
+	return []string{l.modelFor(t)}
+}
+
+// complete runs one provider call, streaming its deltas to the sink.
+//
+// The reported bool is "did anything reach the member": it is what makes the
+// fallback above safe, and it is true from the first content delta, not from
+// the first byte off the socket -- a provider that returns headers and then
+// dies has emitted nothing the member can see.
+func (l *Loop) complete(
+	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
+	answersAt time.Time, alreadySaid string, model string,
+) (domain.Message, domain.Usage, bool, error) {
+	ctx, end := l.span(ctx, "provider.complete", domain.Attr{Key: "model", Value: model})
 	var err error
 	defer func() { end(err) }()
 
+	var emitted bool
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
-		Model:    l.modelFor(t),
+		Model:    model,
 		Window:   w,
 		System:   l.System,
 		Tools:    l.Tools.Available(ctx),
 		Messages: w.Messages,
 	})
 	if err != nil {
-		return domain.Message{}, domain.Usage{}, fmt.Errorf("provider: %w", err)
+		return domain.Message{}, domain.Usage{}, emitted, fmt.Errorf("provider: %w", err)
 	}
 	defer stream.Close()
 
@@ -292,6 +355,7 @@ func (l *Loop) complete(
 	// thought, not per token, and this channel is consumed as though that were
 	// true.
 	content := newCoalescer(50*time.Millisecond, l.Now, func(text string) {
+		emitted = true
 		sink.EmitContent(text)
 	})
 	reasoning := newCoalescer(time.Second, l.Now, func(text string) {
@@ -309,7 +373,7 @@ func (l *Loop) complete(
 			content.Flush()
 			reasoning.Flush()
 			err = fmt.Errorf("provider stream: %w", nerr)
-			return domain.Message{}, domain.Usage{}, err
+			return domain.Message{}, domain.Usage{}, emitted, err
 		}
 		// FR-2: content reaches the client as the model produces it. The sink
 		// comes FIRST -- D-5: durability must never delay delivery.
@@ -335,7 +399,13 @@ func (l *Loop) complete(
 	}
 	content.Flush()
 	reasoning.Flush()
-	return stream.Message(), stream.Usage(), nil
+	// A tool call is not content, but it IS work the turn has committed to:
+	// re-running it under another model would re-run the tool.
+	msg := stream.Message()
+	if len(msg.ToolCalls) > 0 {
+		emitted = true
+	}
+	return msg, stream.Usage(), emitted, nil
 }
 
 // runTool asks the Approver, then invokes -- or turns a refusal into a Result.

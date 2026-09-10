@@ -16,6 +16,16 @@ type Provider interface {
 	Complete(ctx context.Context, req Completion) (Stream, error)
 }
 
+// ModelChain answers which models a turn may run on, in order.
+//
+// A port rather than a field on the loop because the answer changes at runtime:
+// an admin edits the registry and the next turn must see it, without the loop
+// knowing that a file exists. The loop asks once per turn and then owns the
+// order; deciding WHEN to move down it is the loop's, not the chain's.
+type ModelChain interface {
+	Chain(turnModel string) []string
+}
+
 // Stream yields deltas as they arrive.
 //
 // Next returns io.EOF when the completion is finished. Message and Usage are

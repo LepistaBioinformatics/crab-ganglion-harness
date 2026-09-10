@@ -53,6 +53,25 @@ const (
 	// the scheme means changing this string, which makes old ciphertext fail
 	// to decrypt loudly instead of producing garbage.
 	info = "ganglion-credential-v1"
+
+	// picoclawInfo is the SAME construction under picoclaw's domain string.
+	//
+	// The two schemes are byte-identical everywhere else: salt(16)||nonce(12)||
+	// ciphertext, AES-256-GCM, ikm = HMAC-SHA256(SHA256(key file), passphrase),
+	// HKDF-SHA256 to 32 bytes. Only this label differs
+	// (pkg/credential/credential.go:81 upstream).
+	//
+	// Accepting it on DECRYPT is what lets one credential format drive both
+	// harnesses: a value produced by picoclaw's own `credential encrypt`, with
+	// the same passphrase and the same key file, resolves here. Sealing always
+	// uses the ganglion domain -- this reads picoclaw's values, it does not
+	// write them.
+	//
+	// The trade-off is real and is taken deliberately: domain separation is
+	// given up between two contexts that already share both factors and have
+	// one writer (the proxy). What it buys is that an operator does not keep
+	// two ciphertexts of the same key.
+	picoclawInfo = "picoclaw-credential-v1"
 )
 
 // Resolver holds the two factors.
@@ -79,19 +98,23 @@ func (r Resolver) Resolve(v string) (string, error) {
 	}
 	salt, nonce, ct := raw[:saltLen], raw[saltLen:saltLen+nonceLen], raw[saltLen+nonceLen:]
 
-	gcm, err := r.aead(salt)
-	if err != nil {
-		return "", err
+	// Both domains are tried. The ganglion one first, because it is what this
+	// harness seals with and therefore the overwhelmingly common case.
+	for _, domain := range []string{info, picoclawInfo} {
+		gcm, err := r.aead(salt, domain)
+		if err != nil {
+			// A missing factor is not a wrong-domain problem -- it fails the
+			// same way for both, so report it once instead of twice.
+			return "", err
+		}
+		if pt, oerr := gcm.Open(nil, nonce, ct, nil); oerr == nil {
+			return string(pt), nil
+		}
 	}
-	pt, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		// GCM authenticates, so this is "wrong key or tampered value" and
-		// cannot distinguish the two. Say both, because the operator's next
-		// move differs: a wrong passphrase is a typo, a wrong key file is a
-		// missing bind.
-		return "", errors.New("enc:// value did not decrypt: wrong passphrase, wrong key file, or the value was altered")
-	}
-	return string(pt), nil
+	// GCM authenticates, so this is "wrong key or tampered value" and cannot
+	// distinguish the two. Say both, because the operator's next move differs:
+	// a wrong passphrase is a typo, a wrong key file is a missing bind.
+	return "", errors.New("enc:// value did not decrypt: wrong passphrase, wrong key file, or the value was altered")
 }
 
 // Seal encrypts a plaintext into an enc:// URI. Used by the encrypt
@@ -105,7 +128,7 @@ func Seal(r Resolver, plaintext string) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	gcm, err := r.aead(salt)
+	gcm, err := r.aead(salt, info)
 	if err != nil {
 		return "", err
 	}
@@ -113,15 +136,15 @@ func Seal(r Resolver, plaintext string) (string, error) {
 	return Prefix + base64.StdEncoding.EncodeToString(append(append(salt, nonce...), ct...)), nil
 }
 
-// aead derives the AES-256-GCM key for one salt.
+// aead derives the AES-256-GCM key for one salt under one domain string.
 //
 //	fileHash = SHA256(key file)
 //	ikm      = HMAC-SHA256(key: fileHash, message: passphrase)
-//	aesKey   = HKDF-SHA256(ikm, salt, info, 32)
+//	aesKey   = HKDF-SHA256(ikm, salt, domain, 32)
 //
 // The salt is per-value and stored with the ciphertext, so encrypting the same
 // key twice produces different bytes and neither reveals that they match.
-func (r Resolver) aead(salt []byte) (cipher.AEAD, error) {
+func (r Resolver) aead(salt []byte, domain string) (cipher.AEAD, error) {
 	if r.Passphrase == "" {
 		return nil, errors.New("GANGLION_KEY_PASSPHRASE is unset, and an enc:// value cannot be resolved without it")
 	}
@@ -139,7 +162,7 @@ func (r Resolver) aead(salt []byte) (cipher.AEAD, error) {
 	mac.Write([]byte(r.Passphrase))
 	ikm := mac.Sum(nil)
 
-	aesKey, err := hkdf.Key(sha256.New, ikm, salt, info, 32)
+	aesKey, err := hkdf.Key(sha256.New, ikm, salt, domain, 32)
 	if err != nil {
 		return nil, fmt.Errorf("derive the credential key: %w", err)
 	}
