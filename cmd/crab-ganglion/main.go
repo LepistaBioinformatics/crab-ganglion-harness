@@ -11,21 +11,27 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/approver/proxy"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/httpsse"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/openai"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/jsonl"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/window"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/loadimage"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/runtime"
@@ -91,15 +97,23 @@ func main() {
 		logger.Fatalf("workspace: %v", err)
 	}
 
+	models, err := modelRouter(cfg, logger)
+	if err != nil {
+		logger.Fatalf("models: %v", err)
+	}
+	reg := models.Registry()
+	logger.Printf("models: %d configured, default %q", len(reg.Models), reg.Default)
+
 	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
 	loop := &runtime.Loop{
-		Provider:   openai.New(cfg.BaseURL, cfg.APIKey, nil),
+		Provider:   models,
+		Models:     models,
 		Transcript: transcript,
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
 		Checkpoints:     transcript,
 		Context:         window.New(filepath.Join(workspace, "windows")),
-		Tools:           tool.NewRegistry(shellTool(workspace, self)),
+		Tools:           tool.NewRegistry(tools(workspace, self, reg, logger)...),
 		Model:           cfg.Model,
 		System:          systemPrompt(cfg, logger),
 		MaxIterations:   cfg.MaxTurnIter,
@@ -157,6 +171,83 @@ func main() {
 
 // systemPrompt prefers the file, so the proxy's persona cascade can mount one
 // read-only without the container needing a restart to pick up a new value.
+// modelRouter builds the model registry and the router over it.
+//
+// Two sources, and the order between them is the back-compatibility contract:
+// a mounted config file wins, and when there is none the three environment
+// variables synthesize the single entry every deployed container runs on today.
+// A container that has not been recreated since this feature shipped therefore
+// behaves identically, which is the only reason it is safe to ship at all.
+func modelRouter(cfg config.Config, logger *log.Logger) (*router.Router, error) {
+	res := secret.Resolver{Passphrase: cfg.KeyPassphrase, KeyFile: cfg.KeyFile}
+	load := func() (config.Registry, error) {
+		return config.LoadRegistry(cfg.ConfigFile, res, os.Getenv)
+	}
+	reg, err := load()
+	if err != nil {
+		return nil, err
+	}
+	path := cfg.ConfigFile
+	if len(reg.Models) == 0 {
+		// No file, or a file declaring nothing. The environment is the whole
+		// configuration, and there is no path to watch.
+		if cfg.Model == "" || cfg.BaseURL == "" {
+			return nil, fmt.Errorf("no model is configured: %s declares none and GANGLION_MODEL/GANGLION_BASE_URL are unset",
+				cfg.ConfigFile)
+		}
+		reg = config.Registry{
+			Default: config.DefaultModelName,
+			Models: []config.ModelSpec{{
+				Name:    config.DefaultModelName,
+				Model:   cfg.Model,
+				APIBase: cfg.BaseURL,
+				APIKey:  cfg.APIKey,
+				Enabled: true,
+			}},
+		}
+		path = ""
+	}
+	build := func(m config.ModelSpec) domain.Provider {
+		hc := http.DefaultClient
+		if m.TimeoutSec > 0 {
+			hc = &http.Client{Timeout: time.Duration(m.TimeoutSec) * time.Second}
+		}
+		c := openai.New(m.APIBase, m.APIKey, hc)
+		c.ExtraBody = m.ExtraBody
+		c.Headers = m.Headers
+		return c
+	}
+	return router.New(reg, path, build, load, logger.Printf), nil
+}
+
+// tools assembles the tool set.
+//
+// A tool that cannot work is ABSENT rather than present-and-explaining-itself.
+// Telling the model about web_search and then answering "not configured" costs
+// a whole turn to discover something the boot already knew.
+//
+// The set is fixed at boot even though the model registry reloads. Adding or
+// removing a tool changes what the model was told it could do partway through a
+// conversation, and a conversation that has already been offered a capability
+// should not silently lose it -- a container recreate is the honest way to
+// change the tool set, and the proxy already recreates on a bind change.
+func tools(workspace, self string, reg config.Registry, logger *log.Logger) []tool.Tool {
+	// load_image is unconditional: an image in the workspace is something any
+	// deployment can have, and the tool costs nothing when none is there. What
+	// varies is whether a model can SEE the result, which the vision chain
+	// decides at completion time rather than here.
+	out := []tool.Tool{shellTool(workspace, self), loadimage.New(workspace)}
+	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
+		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))
+		logger.Printf("tools: web_search and web_fetch enabled")
+	}
+	if g := imagegen.New(reg, workspace, nil, logger.Printf); g != nil {
+		out = append(out, g)
+		logger.Printf("tools: generate_image enabled")
+	}
+	return out
+}
+
 func systemPrompt(cfg config.Config, logger *log.Logger) string {
 	if cfg.SystemFile == "" {
 		return cfg.System

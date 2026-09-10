@@ -269,3 +269,54 @@ func TestEveryCommandGoesThroughTheSandboxHelper(t *testing.T) {
 		}
 	}
 }
+
+// AC-4 of ganglion-model-registry, and it is a NEW class of leak the existing
+// tests do not cover.
+//
+// Until the model registry existed, everything secret reached the harness
+// through the environment, and TestNoConfiguredVariableIsPassedToCommands plus
+// the agreement test on `passThrough` covered all of it. The registry puts a
+// FILE beside the harness carrying endpoints and, potentially, enc:// keys —
+// and no test asserted that a file outside the workspace is unreachable *by
+// the path the proxy actually mounts it at*.
+//
+// It also guards the design decision, not merely the config: the file lives
+// outside the workspace so a tool steered by untrusted natural language cannot
+// rewrite its own provider endpoint. Put it inside the workspace and this test
+// is what fails.
+func TestACommandCannotReadTheModelRegistryFile(t *testing.T) {
+	requireLandlock(t)
+
+	// The layout the proxy creates: <userDir>/.ganglion holds config.json and
+	// credential.key, and only <userDir>/.ganglion/workspace is mounted.
+	dataDir := t.TempDir()
+	workspace := filepath.Join(dataDir, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dataDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(
+		`{"model_list":[{"model_name":"primary","api_keys":["sk-in-the-registry-file"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := sandboxed(t, workspace)
+	for _, cmd := range []string{
+		"cat " + configPath,
+		`cat $(echo ` + base64Of(configPath) + ` | base64 -d)`,
+		"cat ../config.json",
+		"ls " + dataDir,
+	} {
+		out := run(t, tool, cmd)
+		if strings.Contains(out, "sk-in-the-registry-file") {
+			t.Errorf("%q read the model registry file:\n%s", cmd, out)
+		}
+	}
+
+	// And it cannot be REPLACED either, which is the half that would let a
+	// command choose the endpoint its own keys are sent to.
+	out := run(t, tool, "echo tampered > "+configPath+" ; cat "+configPath)
+	if strings.Contains(out, "tampered") {
+		t.Errorf("a command rewrote the model registry file:\n%s", out)
+	}
+}

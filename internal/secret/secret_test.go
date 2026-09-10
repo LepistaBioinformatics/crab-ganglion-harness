@@ -1,6 +1,8 @@
 package secret
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,5 +156,85 @@ func TestAMalformedValueIsNotAPanic(t *testing.T) {
 		if _, err := r.Resolve(v); err == nil {
 			t.Errorf("%q resolved without error", v)
 		}
+	}
+}
+
+// sealUnder encrypts under an ARBITRARY domain string, so a test can produce
+// bytes this package does not itself write. It is a copy of Seal's body with
+// the one constant lifted out -- deliberately a copy rather than a hook in
+// production code, because the point is to prove the two schemes agree without
+// letting a test change how sealing works.
+func sealUnder(t *testing.T, r Resolver, domain, plaintext string) string {
+	t.Helper()
+	salt := make([]byte, saltLen)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, nonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := r.aead(salt, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := gcm.Seal(nil, nonce, []byte(plaintext), nil)
+	return Prefix + base64.StdEncoding.EncodeToString(append(append(salt, nonce...), ct...))
+}
+
+// THE COMPATIBILITY CLAIM, asserted rather than asserted-about.
+//
+// picoclaw's pkg/credential and this package are the same construction under
+// different domain strings. A key an operator encrypted with picoclaw's own
+// tooling -- same passphrase, same key file -- must resolve here, or "one
+// credential format across the stack" is a sentence in a spec and nothing else.
+func TestAValueSealedInPicoclawsDomainResolves(t *testing.T) {
+	r := fixture(t)
+	got, err := r.Resolve(sealUnder(t, r, picoclawInfo, "sk-from-picoclaw"))
+	if err != nil {
+		t.Fatalf("a picoclaw-domain value must resolve: %v", err)
+	}
+	if got != "sk-from-picoclaw" {
+		t.Fatalf("got %q, want sk-from-picoclaw", got)
+	}
+}
+
+// Reading picoclaw's domain must not mean writing it: everything this harness
+// produces stays in its own domain, so the compatibility is one-directional and
+// deliberate.
+func TestSealingStillUsesTheGanglionDomain(t *testing.T) {
+	r := fixture(t)
+	sealed, err := Seal(r, "sk-mine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(sealed, Prefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt, nonce, ct := raw[:saltLen], raw[saltLen:saltLen+nonceLen], raw[saltLen+nonceLen:]
+
+	gcm, err := r.aead(salt, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gcm.Open(nil, nonce, ct, nil); err != nil {
+		t.Fatal("Seal did not use the ganglion domain")
+	}
+	pico, err := r.aead(salt, picoclawInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pico.Open(nil, nonce, ct, nil); err == nil {
+		t.Fatal("Seal produced a value readable in picoclaw's domain -- the domains have collapsed")
+	}
+}
+
+// A third domain must still fail, or accepting picoclaw's would have meant
+// accepting anything and the authentication would be decorative.
+func TestAnUnknownDomainStillFails(t *testing.T) {
+	r := fixture(t)
+	if _, err := r.Resolve(sealUnder(t, r, "some-other-product-v1", "x")); err == nil {
+		t.Fatal("a value from an unknown domain must not resolve")
 	}
 }
