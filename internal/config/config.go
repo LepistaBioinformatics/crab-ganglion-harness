@@ -11,19 +11,35 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/secret"
 )
+
+// DefaultKeyFile is where crab-shell-proxy binds the credential key file.
+//
+// Beside the harness's data root and NOT under its workspace: the workspace is
+// the only thing the container mounts and the only hierarchy the Landlock
+// ruleset grants, so the agent can reach neither this path nor the directory
+// holding it. That placement is the second factor -- put it inside the
+// workspace and the scheme degenerates to one.
+const DefaultKeyFile = "/data/.ganglion/credential.key"
 
 type Config struct {
 	Addr      string
 	AuthToken string
 
-	Model       string
-	BaseURL     string
-	APIKey      string
-	System      string
-	SystemFile  string
-	DataDir     string
-	MaxTurnIter int
+	Model   string
+	BaseURL string
+	APIKey  string
+	// KeyPassphrase and KeyFile are the two factors that resolve an enc://
+	// value. They are NOT credentials themselves -- either one alone
+	// decrypts nothing.
+	KeyPassphrase string
+	KeyFile       string
+	System        string
+	SystemFile    string
+	DataDir       string
+	MaxTurnIter   int
 
 	ApprovalEndpoint string
 	ApprovalTimeout  time.Duration
@@ -43,6 +59,8 @@ func Load() (Config, error) {
 		Model:            env("GANGLION_MODEL", ""),
 		BaseURL:          os.Getenv("GANGLION_BASE_URL"),
 		APIKey:           os.Getenv("GANGLION_API_KEY"),
+		KeyPassphrase:    os.Getenv("GANGLION_KEY_PASSPHRASE"),
+		KeyFile:          env("GANGLION_KEY_FILE", DefaultKeyFile),
 		System:           os.Getenv("GANGLION_SYSTEM"),
 		SystemFile:       os.Getenv("GANGLION_SYSTEM_FILE"),
 		DataDir:          env("GANGLION_DATA_DIR", "/data/.ganglion"),
@@ -63,6 +81,24 @@ func Load() (Config, error) {
 	}
 	if c.Model == "" {
 		return c, fmt.Errorf("GANGLION_MODEL is required")
+	}
+
+	// enc:// values are resolved HERE, at load, so a wrong passphrase is a
+	// boot failure naming the variable rather than a 401 from the provider
+	// on some member's first message. Same reasoning as BaseURL above.
+	res := secret.Resolver{Passphrase: c.KeyPassphrase, KeyFile: c.KeyFile}
+	for _, f := range []struct {
+		name string
+		p    *string
+	}{
+		{"GANGLION_API_KEY", &c.APIKey},
+		{"GANGLION_TOKEN", &c.AuthToken},
+	} {
+		v, err := res.Resolve(*f.p)
+		if err != nil {
+			return c, fmt.Errorf("%s: %w", f.name, err)
+		}
+		*f.p = v
 	}
 	return c, nil
 }
