@@ -31,6 +31,62 @@ type ModelChain interface {
 	Chain(turnModel string, kind ModelKind) []string
 }
 
+// Learner observes completed turns.
+//
+// A port rather than a call into a package, for the reason AR-2 gives: what
+// happens to a finished turn is a design decision with more than one possible
+// answer -- record it, cluster it, ignore it -- and the loop should not know
+// which one is installed.
+//
+// Observe MUST NOT block the turn. It is called after the answer is durable and
+// after the member has it; an implementation that is slow costs latency nobody
+// is waiting on, but one that returns an error must not fail a turn that
+// already succeeded.
+type Learner interface {
+	Observe(ctx context.Context, r TurnRecord)
+}
+
+// TurnRecord is one completed turn, as evolution sees it.
+//
+// It carries Usage, which picoclaw's equivalent cannot: token accounting is one
+// of the two capabilities that justified building this harness, and the analysis
+// pass can weigh a pattern by what it COST as well as by whether it worked.
+type TurnRecord struct {
+	SessionID  ConversationID
+	SessionKey SessionKey
+	Model      string
+	Input      string
+	Answer     string
+	Tools      []ToolOutcome
+	Usage      Usage
+	Duration   time.Duration
+	// Failed marks a turn that ended in an error. Recorded rather than dropped:
+	// the ratio of failures to successes for a pattern is what the threshold in
+	// min_success_ratio measures, so discarding them would make every pattern
+	// look perfect.
+	Failed bool
+	At     time.Time
+}
+
+// ToolOutcome is one tool invocation inside a turn.
+type ToolOutcome struct {
+	Name string
+	// Denied marks an approval refusal, which is not the same as a failure and
+	// must not be counted as one.
+	Denied bool
+	Failed bool
+}
+
+// SystemPrompt assembles the system message for one turn.
+//
+// A port rather than a string on the loop because what it contains changes while
+// the process runs: the persona file an admin edits, and the skills an
+// administrator or the agent itself adds. Asked once per provider call, so a
+// turn's every iteration sees one coherent prompt.
+type SystemPrompt interface {
+	System(ctx context.Context) string
+}
+
 // ModelKind is what a completion is FOR.
 type ModelKind string
 

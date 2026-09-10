@@ -64,7 +64,16 @@ type Loop struct {
 	// Models is the candidate chain for a turn. Nil means the single Model
 	// above, which is what every deployment did before the registry existed
 	// and what one configured entirely from the environment still does.
-	Models            domain.ModelChain
+	Models domain.ModelChain
+
+	// Prompt assembles the system message. Nil means the static System below,
+	// which is what a deployment with no skills and no persona file uses.
+	Prompt domain.SystemPrompt
+
+	// Learner observes completed turns. Nil means nothing observes them, which
+	// is every deployment with evolution switched off -- and switched off is
+	// the default.
+	Learner           domain.Learner
 	System            string
 	MaxIterations     int
 	ApprovalTimeout   time.Duration
@@ -156,12 +165,29 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// Only the served history is collapsed.
 	var answer strings.Builder
 	var total domain.Usage
+	// Collected for the Learner. Nothing else reads it, and it costs one
+	// append per tool call -- which is why it is gathered unconditionally
+	// rather than behind a nil check that would have to be repeated at every
+	// append site.
+	var outcomes []domain.ToolOutcome
+	started := c.Now()
+	observe := func(failed bool) {
+		if c.Learner == nil {
+			return
+		}
+		c.Learner.Observe(ctx, domain.TurnRecord{
+			SessionID: t.SessionID, SessionKey: t.SessionKey, Model: c.modelFor(t),
+			Input: t.Input.Content, Answer: answer.String(), Tools: outcomes,
+			Usage: total, Duration: c.Now().Sub(started), Failed: failed, At: c.Now(),
+		})
+	}
 
 	for i := 0; i < c.MaxIterations; i++ {
 		msg, usage, err := c.completeWithFallback(ctx, t, window, sink, in.CreatedAt, answer.String())
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
+			observe(true)
 			return answer.String(), runErr
 		}
 		total.Add(usage)
@@ -181,6 +207,10 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			c.recordUsage(ctx, total, t)
 			window = compact(window, c.WindowBudget)
 			runErr = c.Context.Save(ctx, t.SessionID, window)
+			// AFTER the answer is durable and the member has it. A learner that
+			// ran first would put an analysis pass between the model finishing
+			// and the transcript being written.
+			observe(runErr != nil)
 			return answer.String(), runErr
 		}
 
@@ -190,8 +220,11 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				runErr = err
 				sink.EmitError(err.Error())
 				_ = c.finishTurn(ctx, t, answer.String())
+				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
+				observe(true)
 				return answer.String(), runErr
 			}
+			outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Denied: res.Denied})
 			out := domain.Message{
 				Role:       domain.RoleTool,
 				Content:    res.Content,
@@ -231,6 +264,10 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// FR-5: hitting the cap must be said out loud, not inferred later.
 	c.recordUsage(ctx, total, t)
 	sink.EmitError(ErrMaxIterations.Error())
+	// Recorded as a FAILURE. A turn that ran out of iterations produced
+	// something, but it did not finish the work -- counting it as a success
+	// would teach the pattern that whatever it was doing works.
+	observe(true)
 	if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
 		return answer.String(), ferr
 	}
@@ -345,6 +382,21 @@ func (l *Loop) tryChain(
 	return domain.Message{}, domain.Usage{}, lastErr
 }
 
+// systemFor assembles the system message for one provider call.
+//
+// Falls back to the static string rather than to nothing: a Prompt that returns
+// "" because a file went missing must not silently strip an agent's identity
+// mid-conversation, which is the failure a persona bind that never existed
+// already caused once.
+func (l *Loop) systemFor(ctx context.Context) string {
+	if l.Prompt != nil {
+		if s := l.Prompt.System(ctx); s != "" {
+			return s
+		}
+	}
+	return l.System
+}
+
 // modelsFor resolves the ordered candidates for a turn, falling back to the
 // single configured model when no registry is wired.
 //
@@ -423,7 +475,7 @@ func (l *Loop) complete(
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
 		Model:    model,
 		Window:   w,
-		System:   l.System,
+		System:   l.systemFor(ctx),
 		Tools:    l.Tools.Available(ctx),
 		Messages: w.Messages,
 	})

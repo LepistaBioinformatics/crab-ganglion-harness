@@ -126,6 +126,19 @@ type file struct {
 		} `json:"defaults"`
 	} `json:"agents"`
 
+	// Evolution is picoclaw's own block, keys unchanged
+	// (pkg/config/config.go:58-70), so a picoclaw config.json dropped in
+	// behaves the same way here.
+	Evolution *struct {
+		Enabled         *bool    `json:"enabled"`
+		Mode            string   `json:"mode"`
+		StateDir        string   `json:"state_dir"`
+		MinTaskCount    *int     `json:"min_task_count"`
+		MinSuccessRatio *float64 `json:"min_success_ratio"`
+		ColdPathTrigger string   `json:"cold_path_trigger"`
+		ColdPathTimes   []string `json:"cold_path_times"`
+	} `json:"evolution"`
+
 	Tools struct {
 		// Web is decoded twice: once for the settings that are the same for
 		// every provider, and once as a raw map so a provider block can be
@@ -209,7 +222,63 @@ type Registry struct {
 	ImageGenFalls []string
 	// Web is tools.web.
 	Web Web
+	// Evolution is the evolution block, with picoclaw's defaults applied.
+	Evolution Evolution
 }
+
+// EvolutionMode is the opt-in ladder. Each rung does strictly more than the one
+// below it, and the default is the bottom.
+type EvolutionMode string
+
+const (
+	// ModeObserve records what happened and writes nothing else.
+	ModeObserve EvolutionMode = "observe"
+	// ModeDraft additionally generates skill drafts, and writes no skill.
+	ModeDraft EvolutionMode = "draft"
+	// ModeApply may write a skill. Requires an approver -- see R10.1.
+	ModeApply EvolutionMode = "apply"
+)
+
+// ColdTrigger is when the analysis pass runs.
+type ColdTrigger string
+
+const (
+	ColdAfterTurn ColdTrigger = "after_turn"
+	ColdScheduled ColdTrigger = "scheduled"
+	ColdManual    ColdTrigger = "manual"
+)
+
+// Evolution is the resolved evolution configuration.
+type Evolution struct {
+	Enabled         bool
+	Mode            EvolutionMode
+	StateDir        string
+	MinTaskCount    int
+	MinSuccessRatio float64
+	ColdTrigger     ColdTrigger
+	ColdTimes       []string
+}
+
+// picoclaw's defaults (pkg/config/defaults.go:50-56), carried over so a config
+// written for one harness behaves identically on the other.
+const (
+	DefaultMinTaskCount    = 2
+	DefaultMinSuccessRatio = 0.7
+)
+
+// Records reports whether the hot path should write anything at all.
+//
+// AC-1: with evolution off, nothing is written and no turn is measurably
+// slower. The hot path is OFF, not merely quiet.
+func (e Evolution) Records() bool { return e.Enabled }
+
+// Drafts reports whether the cold path may generate.
+func (e Evolution) Drafts() bool {
+	return e.Enabled && (e.Mode == ModeDraft || e.Mode == ModeApply)
+}
+
+// Writes reports whether an accepted draft may reach disk.
+func (e Evolution) Writes() bool { return e.Enabled && e.Mode == ModeApply }
 
 // Kind selects which chain a turn needs.
 type Kind string
@@ -352,6 +421,7 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 		reg.Default = reg.Models[0].Name
 	}
 
+	reg.Evolution = loadEvolution(f.Evolution)
 	reg.Vision = f.Agents.Defaults.ImageModel
 	reg.VisionFalls = f.Agents.Defaults.ImageModelFallbacks
 	reg.ImageGen = f.Agents.Defaults.ImageGenModel
@@ -471,4 +541,51 @@ func KeyEnvVar(modelName string) string {
 		}
 	}
 	return b.String()
+}
+
+// loadEvolution applies picoclaw's defaults to whatever the file said.
+//
+// An unrecognised mode or trigger falls back to the SAFEST value rather than
+// failing the load. A typo in `mode` must not stop an agent from answering, and
+// the safe direction is unambiguous here: observe records and writes nothing.
+func loadEvolution(raw *struct {
+	Enabled         *bool    `json:"enabled"`
+	Mode            string   `json:"mode"`
+	StateDir        string   `json:"state_dir"`
+	MinTaskCount    *int     `json:"min_task_count"`
+	MinSuccessRatio *float64 `json:"min_success_ratio"`
+	ColdPathTrigger string   `json:"cold_path_trigger"`
+	ColdPathTimes   []string `json:"cold_path_times"`
+}) Evolution {
+	e := Evolution{
+		Mode:            ModeObserve,
+		MinTaskCount:    DefaultMinTaskCount,
+		MinSuccessRatio: DefaultMinSuccessRatio,
+		ColdTrigger:     ColdAfterTurn,
+	}
+	if raw == nil {
+		return e
+	}
+	e.Enabled = raw.Enabled != nil && *raw.Enabled
+	e.StateDir = raw.StateDir
+	e.ColdTimes = raw.ColdPathTimes
+	switch EvolutionMode(strings.TrimSpace(raw.Mode)) {
+	case ModeDraft:
+		e.Mode = ModeDraft
+	case ModeApply:
+		e.Mode = ModeApply
+	}
+	switch ColdTrigger(strings.TrimSpace(raw.ColdPathTrigger)) {
+	case ColdScheduled:
+		e.ColdTrigger = ColdScheduled
+	case ColdManual:
+		e.ColdTrigger = ColdManual
+	}
+	if raw.MinTaskCount != nil && *raw.MinTaskCount > 0 {
+		e.MinTaskCount = *raw.MinTaskCount
+	}
+	if raw.MinSuccessRatio != nil && *raw.MinSuccessRatio > 0 {
+		e.MinSuccessRatio = *raw.MinSuccessRatio
+	}
+	return e
 }
