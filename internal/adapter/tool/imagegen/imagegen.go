@@ -123,7 +123,7 @@ func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, 
 			t.logf("generate_image: %v", lastErr)
 			continue
 		}
-		paths, err := t.write(images)
+		paths, err := t.write(ctx, images)
 		if err != nil {
 			// A write failure is NOT a reason to try another model: the model
 			// did its job and the disk did not, and re-generating would spend
@@ -218,8 +218,11 @@ func wireModel(m config.ModelSpec) string {
 // member-influenced input, and this process is not confined by the Landlock
 // domain the shell tool runs under -- so a name is the one place a traversal
 // could reach outside the workspace.
-func (t *Tool) write(images [][]byte) ([]string, error) {
-	dir := filepath.Join(t.workspace, MediaDirName)
+func (t *Tool) write(ctx context.Context, images [][]byte) ([]string, error) {
+	// Under the PROJECT's root when there is one, because load_image resolves
+	// relative paths the same way. The two tools have to agree: a generated
+	// image the model cannot then load back is worse than no generation.
+	dir := filepath.Join(domain.ProjectRoot(ctx, t.workspace), MediaDirName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}

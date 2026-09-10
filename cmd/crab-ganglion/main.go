@@ -112,7 +112,14 @@ func main() {
 		logger.Printf("models: %s", w)
 	}
 
+	// The per-project subtrees live under the workspace, not beside it: the
+	// container binds exactly one directory, and a project must not need a
+	// second mount -- creating one would mean recreating the container, which
+	// for a scale-to-zero agent may not even be running.
+	projects := filepath.Join(workspace, domain.ProjectsDirName)
+
 	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
+	transcript.Projects = projects
 	loop := &runtime.Loop{
 		Provider:   models,
 		Models:     models,
@@ -121,7 +128,7 @@ func main() {
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
 		Checkpoints: transcript,
-		Context:     window.New(filepath.Join(workspace, "windows")),
+		Context:     windowStore(workspace, projects),
 		Model:       cfg.Model,
 		System:      systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{
@@ -452,4 +459,15 @@ func encrypt() error {
 	}
 	fmt.Println(v)
 	return nil
+}
+
+// windowStore is the context store, project-aware.
+//
+// A function rather than an inline literal only because the Loop's field is
+// typed as the port, so the two assignments could not be written in one
+// expression without losing the concrete type the second one needs.
+func windowStore(workspace, projects string) *window.Store {
+	w := window.New(filepath.Join(workspace, "windows"))
+	w.Projects = projects
+	return w
 }

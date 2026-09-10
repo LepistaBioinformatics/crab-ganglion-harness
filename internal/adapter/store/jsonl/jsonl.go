@@ -37,30 +37,32 @@ var (
 // Store writes transcripts under Root.
 type Store struct {
 	Root string
+	// Projects, when set, is the parent of the per-project subtrees. See dir.
+	Projects string
 
 	mu sync.Mutex
 }
 
 func New(root string) *Store { return &Store{Root: root} }
 
-func (s *Store) path(id domain.ConversationID) string {
-	return filepath.Join(s.Root, safe(string(id))+".jsonl")
+func (s *Store) path(ctx context.Context, id domain.ConversationID) string {
+	return filepath.Join(s.dir(ctx), safe(string(id))+".jsonl")
 }
 
 // Append adds one message. The write is O(1) in the file's size, which is what
 // makes an append-only transcript affordable for a long conversation.
-func (s *Store) Append(_ context.Context, id domain.ConversationID, m domain.Message) error {
+func (s *Store) Append(ctx context.Context, id domain.ConversationID, m domain.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := os.MkdirAll(s.Root, 0o755); err != nil {
+	if err := os.MkdirAll(s.dir(ctx), 0o755); err != nil {
 		return fmt.Errorf("transcript dir: %w", err)
 	}
 	line, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
-	f, err := os.OpenFile(s.path(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(s.path(ctx, id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("open transcript: %w", err)
 	}
@@ -86,8 +88,8 @@ func (s *Store) Append(_ context.Context, id domain.ConversationID, m domain.Mes
 // partials inside the JSONL was the obvious alternative and it fails exactly
 // there -- an older reader would show the same growing answer once per
 // checkpoint.
-func (s *Store) partialPath(id domain.ConversationID) string {
-	return filepath.Join(s.Root, safe(string(id))+".partial.json")
+func (s *Store) partialPath(ctx context.Context, id domain.ConversationID) string {
+	return filepath.Join(s.dir(ctx), safe(string(id))+".partial.json")
 }
 
 // Partial is an answer that was still streaming.
@@ -106,19 +108,19 @@ type Partial struct {
 // Rewriting this file is fine -- it is derived, like the context window. The
 // append-only invariant belongs to the transcript, and the transcript is not
 // this file.
-func (s *Store) Checkpoint(_ context.Context, id domain.ConversationID, answersAt time.Time, content string) error {
+func (s *Store) Checkpoint(ctx context.Context, id domain.ConversationID, answersAt time.Time, content string) error {
 	p := Partial{AnswersAt: answersAt, Content: content, UpdatedAt: time.Now()}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := os.MkdirAll(s.Root, 0o755); err != nil {
+	if err := os.MkdirAll(s.dir(ctx), 0o755); err != nil {
 		return fmt.Errorf("transcript dir: %w", err)
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.Root, ".partial-*")
+	tmp, err := os.CreateTemp(s.dir(ctx), ".partial-*")
 	if err != nil {
 		return fmt.Errorf("temp partial: %w", err)
 	}
@@ -135,7 +137,7 @@ func (s *Store) Checkpoint(_ context.Context, id domain.ConversationID, answersA
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.partialPath(id))
+	return os.Rename(tmp.Name(), s.partialPath(ctx, id))
 }
 
 // ClearPartial removes the sidecar. Called after the real message is appended.
@@ -143,10 +145,10 @@ func (s *Store) Checkpoint(_ context.Context, id domain.ConversationID, answersA
 // The crash window between that append and this call is exactly what
 // Partial.AnswersAt exists to make harmless: a reader finding both sees an
 // assistant message at or after AnswersAt and ignores the sidecar.
-func (s *Store) ClearPartial(_ context.Context, id domain.ConversationID) error {
+func (s *Store) ClearPartial(ctx context.Context, id domain.ConversationID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := os.Remove(s.partialPath(id))
+	err := os.Remove(s.partialPath(ctx, id))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -160,7 +162,7 @@ func (s *Store) ClearPartial(_ context.Context, id domain.ConversationID) error 
 // nothing to add, and distinguishing them would invite a caller to treat a
 // stale partial as recoverable.
 func (s *Store) ReadPartial(ctx context.Context, id domain.ConversationID) (Partial, bool, error) {
-	b, err := os.ReadFile(s.partialPath(id))
+	b, err := os.ReadFile(s.partialPath(ctx, id))
 	if os.IsNotExist(err) {
 		return Partial{}, false, nil
 	}
@@ -189,11 +191,11 @@ func (s *Store) ReadPartial(ctx context.Context, id domain.ConversationID) (Part
 
 // Read returns the whole transcript. A missing file is an empty conversation,
 // not an error -- the first turn of every session reads before it writes.
-func (s *Store) Read(_ context.Context, id domain.ConversationID) ([]domain.Message, error) {
+func (s *Store) Read(ctx context.Context, id domain.ConversationID) ([]domain.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.Open(s.path(id))
+	f, err := os.Open(s.path(ctx, id))
 	if os.IsNotExist(err) {
 		return []domain.Message{}, nil
 	}
@@ -236,7 +238,43 @@ func (s *Store) Read(_ context.Context, id domain.ConversationID) ([]domain.Mess
 // watched appear; an answer cut mid-sentence already reads as cut, and a marker
 // field would be invisible to internal/history's parser anyway (H-2).
 func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err error) {
-	entries, rerr := os.ReadDir(s.Root)
+	f, d, err := s.recoverIn(ctx)
+	folded, dropped = f, d
+	if err != nil {
+		return folded, dropped, err
+	}
+	// EVERY project, not only the main workspace. A crash does not care which
+	// project the turn belonged to, and a partial nobody folds is an answer the
+	// member watched appear and then never sees again.
+	//
+	// Read from disk rather than from a project list, because this runs at boot
+	// and the harness has no list -- the proxy owns it, and a directory that
+	// exists is exactly the set that could hold a sidecar.
+	if s.Projects == "" {
+		return folded, dropped, nil
+	}
+	projects, rerr := os.ReadDir(s.Projects)
+	if rerr != nil {
+		return folded, dropped, nil
+	}
+	for _, p := range projects {
+		if !p.IsDir() {
+			continue
+		}
+		pf, pd, perr := s.recoverIn(domain.WithProject(ctx, p.Name()))
+		if perr != nil {
+			// One unreadable project must not stop the rest, for the reason
+			// one unreadable sidecar must not: this is boot.
+			continue
+		}
+		folded, dropped = folded+pf, dropped+pd
+	}
+	return folded, dropped, nil
+}
+
+// recoverIn does one directory: the main workspace's, or one project's.
+func (s *Store) recoverIn(ctx context.Context) (folded, dropped int, err error) {
+	entries, rerr := os.ReadDir(s.dir(ctx))
 	if os.IsNotExist(rerr) {
 		return 0, 0, nil
 	}
@@ -306,4 +344,26 @@ func safe(s string) string {
 		return "_"
 	}
 	return string(out)
+}
+
+// dir is the directory this turn reads and writes.
+//
+// A turn with no project gets Root, byte for byte the path this store has always
+// used -- which is the regression bar for the whole feature, because getting it
+// wrong orphans every existing transcript silently.
+//
+// The leaf name is taken from Root rather than configured separately, so the
+// two can never disagree: <workspace>/sessions becomes
+// <workspace>/projects/<id>/sessions, and the same store type serves windows
+// without knowing it.
+//
+// safe() is applied to the project too. The ingress already refuses anything
+// outside [a-z0-9_-], and a store that trusted that would be one refactor away
+// from writing wherever a header said.
+func (s *Store) dir(ctx context.Context) string {
+	p := domain.ProjectFrom(ctx)
+	if p == "" || s.Projects == "" {
+		return s.Root
+	}
+	return filepath.Join(s.Projects, safe(p), filepath.Base(s.Root))
 }

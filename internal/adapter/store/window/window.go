@@ -18,21 +18,23 @@ import (
 
 type Store struct {
 	Root string
+	// Projects, when set, is the parent of the per-project subtrees. See dir.
+	Projects string
 
 	mu sync.Mutex
 }
 
 func New(root string) *Store { return &Store{Root: root} }
 
-func (s *Store) path(id domain.ConversationID) string {
-	return filepath.Join(s.Root, safe(string(id))+".window.json")
+func (s *Store) path(ctx context.Context, id domain.ConversationID) string {
+	return filepath.Join(s.dir(ctx), safe(string(id))+".window.json")
 }
 
-func (s *Store) Load(_ context.Context, id domain.ConversationID) (domain.Window, error) {
+func (s *Store) Load(ctx context.Context, id domain.ConversationID) (domain.Window, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	b, err := os.ReadFile(s.path(id))
+	b, err := os.ReadFile(s.path(ctx, id))
 	if os.IsNotExist(err) {
 		return domain.Window{}, nil
 	}
@@ -50,19 +52,19 @@ func (s *Store) Load(_ context.Context, id domain.ConversationID) (domain.Window
 
 // Save writes atomically. A window truncated by a crash mid-write would be read
 // back as corrupt on the next turn -- survivable, but needlessly.
-func (s *Store) Save(_ context.Context, id domain.ConversationID, w domain.Window) error {
+func (s *Store) Save(ctx context.Context, id domain.ConversationID, w domain.Window) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := os.MkdirAll(s.Root, 0o755); err != nil {
+	if err := os.MkdirAll(s.dir(ctx), 0o755); err != nil {
 		return fmt.Errorf("window dir: %w", err)
 	}
 	b, err := json.Marshal(w)
 	if err != nil {
 		return fmt.Errorf("marshal window: %w", err)
 	}
-	final := s.path(id)
-	tmp, err := os.CreateTemp(s.Root, ".window-*")
+	final := s.path(ctx, id)
+	tmp, err := os.CreateTemp(s.dir(ctx), ".window-*")
 	if err != nil {
 		return fmt.Errorf("temp window: %w", err)
 	}
@@ -94,4 +96,26 @@ func safe(s string) string {
 		return "_"
 	}
 	return string(out)
+}
+
+// dir is the directory this turn reads and writes.
+//
+// A turn with no project gets Root, byte for byte the path this store has always
+// used -- which is the regression bar for the whole feature, because getting it
+// wrong orphans every existing transcript silently.
+//
+// The leaf name is taken from Root rather than configured separately, so the
+// two can never disagree: <workspace>/sessions becomes
+// <workspace>/projects/<id>/sessions, and the same store type serves windows
+// without knowing it.
+//
+// safe() is applied to the project too. The ingress already refuses anything
+// outside [a-z0-9_-], and a store that trusted that would be one refactor away
+// from writing wherever a header said.
+func (s *Store) dir(ctx context.Context) string {
+	p := domain.ProjectFrom(ctx)
+	if p == "" || s.Projects == "" {
+		return s.Root
+	}
+	return filepath.Join(s.Projects, safe(p), filepath.Base(s.Root))
 }

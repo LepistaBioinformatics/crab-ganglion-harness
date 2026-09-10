@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
 
 var pngBytes = append([]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}, 0, 1, 2)
@@ -184,4 +185,26 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// generate_image writes where load_image reads. The two must agree, per
+// project as they already do for the main workspace -- a generated image the
+// model cannot then load back is worse than no generation at all.
+func TestAProjectsGeneratedImageLandsInThatProjectsMediaDirectory(t *testing.T) {
+	srv := imageServer(t, http.StatusOK, 1)
+	defer srv.Close()
+	ws := t.TempDir()
+
+	tool := New(reg(spec("art", srv.URL, "k")), ws, srv.Client(), nil)
+	ctx := domain.WithProject(context.Background(), "seed-trial")
+	res, _ := tool.Invoke(ctx, json.RawMessage(`{"prompt":"a crab"}`))
+
+	dir := filepath.Join(ws, domain.ProjectsDirName, "seed-trial", MediaDirName)
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("nothing was written to %s (%v):\n%s", dir, err, res.Content)
+	}
+	if _, err := os.Stat(filepath.Join(ws, MediaDirName)); !os.IsNotExist(err) {
+		t.Error("the project's image also landed in the main workspace")
+	}
 }

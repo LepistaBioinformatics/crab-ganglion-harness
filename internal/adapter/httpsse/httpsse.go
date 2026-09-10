@@ -81,6 +81,19 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// REFUSED BEFORE THE STREAM OPENS, and refused rather than ignored.
+	//
+	// The id becomes a directory name, so this is the whole distance between a
+	// header and a path traversal. And a request naming a project that cannot
+	// exist must not quietly fall through to the main workspace: that writes a
+	// member's conversation into the wrong place, which is worse than an error
+	// and much harder to notice.
+	project := req.project(r)
+	if project != "" && !domain.ValidProject(project) {
+		http.Error(w, "invalid project", http.StatusBadRequest)
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -104,6 +117,7 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		SessionID:  domain.ConversationID(req.sessionID(r)),
 		SessionKey: domain.SessionKey(req.sessionKey(r)),
 		Model:      req.Model,
+		Project:    project,
 		Input: domain.Message{
 			Role:        domain.RoleUser,
 			Content:     last,
@@ -158,6 +172,9 @@ type request struct {
 		} `json:"attachments,omitempty"`
 	} `json:"messages"`
 	SessionID string `json:"session_id"`
+	// Project scopes the turn to one of the member's projects. Read from the
+	// body only as a fallback; the header is the contract.
+	Project string `json:"project"`
 }
 
 // attachments decodes the media on the last user message.
@@ -216,6 +233,17 @@ func (r request) sessionKey(hr *http.Request) string {
 		return v
 	}
 	return r.sessionID(hr)
+}
+
+// project comes from a header the proxy sets, on the same rule as sessionID:
+// the proxy owns the store that maps a chat to a project, and a harness that
+// re-derived it from anything -- the session id's shape, say -- would be a
+// second implementation of somebody else's convention.
+func (r request) project(hr *http.Request) string {
+	if v := hr.Header.Get("X-Ganglion-Project"); v != "" {
+		return v
+	}
+	return r.Project
 }
 
 func (r request) id() string { return "chatcmpl-ganglion" }
