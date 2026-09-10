@@ -1,0 +1,115 @@
+# Build and publish the harness image to GHCR.
+#
+# WHY THERE IS NO MOVING TAG HERE
+#
+# No `:latest`, no `:main`, no version tag that is ever rebuilt. Every image
+# this workflow publishes is addressed by the commit that produced it, and a
+# given tag names the same bytes forever.
+#
+# That is not general hygiene, it is this stack's own scar. crab-shell-proxy
+# pulls the harness image with EnsureImage, which has a fast path: if the name
+# resolves locally it returns without contacting the registry. The harness
+# image is also not a compose service, so a redeploy never pulls it either.
+# Rebuild a tag under those two facts and the host keeps running the old bytes
+# indefinitely, with no log, no drift, no failure -- which is exactly what
+# happened to picoclaw:0.3.1-glob, for three weeks, with two of four patches
+# missing. See the parent monorepo's
+# .specs/features/own-go-harness/investigation.md, section 2.3.
+#
+# The cost is that updating a deployment means changing CRAB_GANGLION_IMAGE to
+# a new sha. That is the point: it makes the update a decision someone makes,
+# rather than something that silently did or did not happen.
+#
+# WHY THE TESTS ARE NOT A SEPARATE JOB
+#
+# They run inside the Dockerfile, so the image cannot be built without them
+# passing. A parallel test job would prove something about the source; this
+# proves something about the artefact being published.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/lepistabioinformatics/crab-ganglion
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute the immutable reference
+        id: ref
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short=12 HEAD)"
+          TAGS="${IMAGE}:sha-${SHA}"
+
+          # A git tag additionally publishes its own name. That tag is
+          # immutable too -- re-tagging a released version in git is already
+          # something this project does not do, and the registry would reject
+          # nothing, so the discipline has to hold here.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAGS="${TAGS},${IMAGE}:${GITHUB_REF_NAME}"
+          fi
+
+          echo "sha=${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          # No cache. The Dockerfile's `go vet` and `go test` steps ARE this
+          # image's acceptance check; replaying them from a layer cache would
+          # make a green run stop being evidence that they ran for these bytes.
+          no-cache: true
+          tags: ${{ steps.ref.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=crab-ganglion-harness
+            org.opencontainers.image.description=zombie-crab's own agent harness: native HTTP+SSE, token-level streaming, token accounting
+            org.opencontainers.image.source=https://github.com/LepistaBioinformatics/crab-ganglion-harness
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Report what to deploy
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "CRAB_GANGLION_IMAGE=${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Or by tag, which names the same bytes:"
+            echo
+            echo '```'
+            echo "CRAB_GANGLION_IMAGE=${IMAGE}:sha-${{ steps.ref.outputs.sha }}"
+            echo '```'
+            echo
+            echo "Pinning by **digest** is the stronger of the two: a tag is immutable"
+            echo "by this workflow's discipline, a digest by construction."
+            echo
+            echo "After changing it, the running containers do NOT update on their own"
+            echo "in a way you can rely on -- \`docker pull\` on the host first, then the"
+            echo "proxy's imageDrift check recreates each agent on its next turn."
+          } >> "$GITHUB_STEP_SUMMARY"
