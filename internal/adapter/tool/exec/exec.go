@@ -228,9 +228,13 @@ func (t *Tool) projectDir(ctx context.Context) string {
 	if root == t.Workdir {
 		return t.Workdir
 	}
-	dir := filepath.Join(root, domain.ProjectFilesDirName)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// The PROJECT ROOT, not a files/ child of it. The main workspace's shell
+	// starts where uploads/, media/ and sessions/ are children; a project's
+	// must too, or the same instruction ("read uploads/report.csv") means two
+	// different paths depending on where the member happens to be. The proxy
+	// writes a project's uploads under this directory for the same reason.
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		return t.Workdir
 	}
-	return dir
+	return root
 }

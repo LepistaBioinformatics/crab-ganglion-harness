@@ -71,8 +71,3 @@ func ProjectRoot(ctx context.Context, workspace string) string {
 // per-project subtrees. Reserved: a conversation or a file named "projects" in
 // the main workspace would otherwise collide with the tree.
 const ProjectsDirName = "projects"
-
-// ProjectFilesDirName is where a project's working files live -- the shell's
-// working directory for a project turn. The main workspace has no equivalent
-// level, because it IS that level.
-const ProjectFilesDirName = "files"
