@@ -33,9 +33,14 @@ func turn() domain.Turn {
 	}
 }
 
-// FR-2: content reaches the sink as deltas, not as one blob at the end. This is
-// the capability the harness exists for, so it is the first test.
-func TestRun_StreamsContentAsDeltas(t *testing.T) {
+// FR-2: content reaches the sink progressively, not as one blob at the end.
+//
+// Deltas are COALESCED on a 50ms wall clock (see coalesce.go), so the
+// assertion is "arrives in pieces as time passes", not "one emission per
+// provider token" -- the provider's token boundaries are not a unit anyone
+// perceives, and forwarding them one for one made the webapp re-render per
+// syllable.
+func TestRun_StreamsContentProgressively(t *testing.T) {
 	p := &fakeProvider{turns: []fakeTurn{{
 		deltas: []string{"Oi", ", ", "tudo bem?"},
 		msg:    domain.Message{Role: domain.RoleAssistant, Content: "Oi, tudo bem?"},
@@ -43,6 +48,10 @@ func TestRun_StreamsContentAsDeltas(t *testing.T) {
 	}}}
 	c := &collect{}
 	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	// A clock that advances past the coalescing interval on every read, so
+	// each delta lands in its own batch.
+	tick := time.Unix(0, 0)
+	l.Now = func() time.Time { tick = tick.Add(100 * time.Millisecond); return tick }
 
 	got, err := l.Run(context.Background(), turn(), c.sink())
 	if err != nil {
@@ -51,11 +60,32 @@ func TestRun_StreamsContentAsDeltas(t *testing.T) {
 	if got != "Oi, tudo bem?" {
 		t.Errorf("answer = %q", got)
 	}
-	if len(c.content) != 3 {
-		t.Errorf("expected 3 deltas, got %d (%q) -- a single delta means the loop buffered", len(c.content), c.content)
+	if len(c.content) < 2 {
+		t.Errorf("content arrived in %d piece(s) (%q) -- the loop buffered the whole answer", len(c.content), c.content)
 	}
 	if c.joined() != "Oi, tudo bem?" {
-		t.Errorf("deltas joined = %q", c.joined())
+		t.Errorf("pieces joined = %q; coalescing must not lose or reorder text", c.joined())
+	}
+}
+
+// The other half: when every delta lands inside one interval, the final flush
+// must still deliver all of it. Nothing may be dropped because the turn was
+// fast.
+func TestRun_AFastStreamStillDeliversEverything(t *testing.T) {
+	p := &fakeProvider{turns: []fakeTurn{{
+		deltas: []string{"Be", "le", "za", "!"},
+		msg:    domain.Message{Role: domain.RoleAssistant, Content: "Beleza!"},
+	}}}
+	c := &collect{}
+	// newLoop's clock is frozen, so the interval never elapses and only the
+	// end-of-stream flush runs.
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+
+	if _, err := l.Run(context.Background(), turn(), c.sink()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if c.joined() != "Beleza!" {
+		t.Errorf("joined = %q, want the whole answer", c.joined())
 	}
 }
 

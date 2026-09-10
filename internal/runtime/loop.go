@@ -224,21 +224,47 @@ func (l *Loop) complete(
 
 	var partial strings.Builder
 	lastCheckpoint := l.Now()
+
+	// Deltas are COALESCED before they reach the sink, and that is not an
+	// optimisation -- it is the difference between working and not.
+	//
+	// A provider emits sub-word tokens ("Be", "le", "za"). Each one that
+	// reaches the client costs a re-render and, in the webapp, a re-parse of
+	// the whole revealed markdown; its reveal driver additionally re-plans on
+	// every content delta, having been written when "picoclaw sends the whole
+	// answer in one frame, so in practice this runs once per turn". Emitting
+	// per token turned one re-plan into hundreds and the reply visibly
+	// rewrote itself as it arrived.
+	//
+	// 50ms is ~20 updates a second: past what anyone perceives as anything but
+	// smooth, and an order of magnitude fewer renders. Reasoning is coarser
+	// still at 1s, because it is NARRATION -- picoclaw emits a frame per
+	// thought, not per token, and this channel is consumed as though that were
+	// true.
+	content := newCoalescer(50*time.Millisecond, l.Now, func(text string) {
+		sink.EmitContent(text)
+	})
+	reasoning := newCoalescer(time.Second, l.Now, func(text string) {
+		sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: text})
+	})
+
 	for {
 		d, nerr := stream.Next(ctx)
 		if errors.Is(nerr, io.EOF) {
 			break
 		}
 		if nerr != nil {
+			// Flush before reporting: whatever arrived is the member's, even
+			// though the turn failed.
+			content.Flush()
+			reasoning.Flush()
 			err = fmt.Errorf("provider stream: %w", nerr)
 			return domain.Message{}, domain.Usage{}, err
 		}
 		// FR-2: content reaches the client as the model produces it. The sink
 		// comes FIRST -- D-5: durability must never delay delivery.
-		sink.EmitContent(d.Content)
-		if d.Reasoning != "" {
-			sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: d.Reasoning})
-		}
+		content.Add(d.Content)
+		reasoning.Add(d.Reasoning)
 		partial.WriteString(d.Content)
 
 		// D-2. On the delta path rather than in a goroutine: an 887us write
@@ -257,6 +283,8 @@ func (l *Loop) complete(
 			lastCheckpoint = l.Now()
 		}
 	}
+	content.Flush()
+	reasoning.Flush()
 	return stream.Message(), stream.Usage(), nil
 }
 
