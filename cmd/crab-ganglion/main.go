@@ -19,6 +19,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/openai"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/jsonl"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/window"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/config"
@@ -61,6 +62,16 @@ func main() {
 		MaxIterations:   cfg.MaxTurnIter,
 		ApprovalTimeout: cfg.ApprovalTimeout,
 	}
+	// FR-10. Unset endpoint means the exporter posts nothing, so a deployment
+	// without a collector behaves exactly as before rather than logging a
+	// failed request per turn.
+	if cfg.OTLPEndpoint != "" {
+		tel := otlp.New(cfg.OTLPEndpoint, "crab-ganglion", nil)
+		tel.Logf = logger.Printf
+		loop.Telemetry = tel
+		logger.Printf("telemetry: exporting to %s", cfg.OTLPEndpoint)
+	}
+
 	// Left unset, the loop installs an allow-all approver. Assigned only when
 	// an endpoint exists, so a typed nil can never reach the port.
 	if cfg.ApprovalEndpoint != "" {
