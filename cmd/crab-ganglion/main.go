@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/approver/proxy"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/evolution"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/httpsse"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/openai"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
@@ -37,6 +38,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/runtime"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/secret"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/skillfile"
 )
 
 func main() {
@@ -142,8 +144,25 @@ func main() {
 
 	// Left unset, the loop installs an allow-all approver. Assigned only when
 	// an endpoint exists, so a typed nil can never reach the port.
+	var approver domain.Approver
 	if cfg.ApprovalEndpoint != "" {
-		loop.Approver = proxy.New(cfg.ApprovalEndpoint, cfg.AuthToken, cfg.GatedTools, nil)
+		gated := append(append([]string(nil), cfg.GatedTools...), evolution.ApprovalAction)
+		approver = proxy.New(cfg.ApprovalEndpoint, cfg.AuthToken, gated, nil)
+		loop.Approver = approver
+	}
+
+	if engine, err := learner(cfg, reg, models, workspace, approver, logger); err != nil {
+		// FATAL, and this is the point of D-2 rather than an inconvenience.
+		//
+		// The failures here are both of the same kind: a configuration that
+		// SAYS something will happen and cannot make it happen. Downgrading to
+		// a working mode would leave an operator believing apply was on, or
+		// believing a nightly pass was running, which is the "stores a setting
+		// that changes nothing" failure this whole feature was gated on.
+		logger.Fatalf("evolution: %v", err)
+	} else if engine != nil {
+		loop.Learner = engine
+		logger.Printf("evolution: enabled, mode %s, trigger %s", reg.Evolution.Mode, reg.Evolution.ColdTrigger)
 	}
 
 	// Recovery runs before the first turn is served. Under scale-to-zero this
@@ -257,6 +276,54 @@ func tools(workspace, self string, reg config.Registry, logger *log.Logger) []to
 		logger.Printf("tools: generate_image enabled")
 	}
 	return out
+}
+
+// learner builds the evolution engine, or refuses to boot.
+//
+// Returns (nil, nil) when evolution is off, which is the default and every
+// deployment today. The two errors are the whole of D-2 and R11.
+func learner(
+	cfg config.Config, reg config.Registry, models domain.Provider,
+	workspace string, approver domain.Approver, logger *log.Logger,
+) (*evolution.Engine, error) {
+	e := reg.Evolution
+	if !e.Enabled {
+		return nil, nil
+	}
+
+	// D-2 / R10.1. The loop's default approver allows everything, so `apply`
+	// with no endpoint configured would write skills with nobody asked -- and
+	// "apply requires approval" would be a sentence that changes nothing.
+	if e.Writes() && approver == nil {
+		return nil, fmt.Errorf(
+			"mode %q writes skills and requires an approver, but GANGLION_APPROVAL_ENDPOINT is unset. "+
+				"Set it, or use mode \"draft\"", e.Mode)
+	}
+
+	// R11. A stopped container fires no timers, so a scheduled pass on a
+	// scale-to-zero agent stores an intention and runs nothing. This stack has
+	// already made exactly this call once, for cron.
+	if e.ColdTrigger == config.ColdScheduled && cfg.Lifecycle == "scale-to-zero" {
+		return nil, fmt.Errorf(
+			"cold_path_trigger %q cannot work in scale-to-zero: a stopped container fires no timers. "+
+				"Use \"after_turn\", or run this agent continuous", e.ColdTrigger)
+	}
+
+	state := e.StateDir
+	if state == "" {
+		// Inside the workspace, so what the agent has learned survives a
+		// container recreate -- which under scale-to-zero happens routinely.
+		state = filepath.Join(workspace, "state", "evolution")
+	}
+	return &evolution.Engine{
+		Cfg:       e,
+		StateDir:  state,
+		SkillsDir: filepath.Join(workspace, skillfile.DirName),
+		Provider:  models,
+		Model:     reg.Default,
+		Approver:  approver,
+		Logf:      logger.Printf,
+	}, nil
 }
 
 func systemPrompt(cfg config.Config, logger *log.Logger) string {

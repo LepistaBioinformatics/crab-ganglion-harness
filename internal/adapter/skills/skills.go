@@ -34,6 +34,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/skillfile"
 )
 
 // DefaultBudget bounds the rendered index.
@@ -42,12 +44,14 @@ import (
 // small enough that the index never competes with the conversation for room.
 const DefaultBudget = 8 << 10
 
-// DirName is the skills directory inside a workspace.
-const DirName = "skills"
+// Re-exported so callers of this package do not have to import two.
+const (
+	DirName  = skillfile.DirName
+	FileName = skillfile.FileName
+)
 
-// FileName is picoclaw's, unchanged, so a skill written by one harness's
-// evolution loads in the other.
-const FileName = "SKILL.md"
+// Frontmatter is skillfile's, re-exported for the same reason.
+var Frontmatter = skillfile.Frontmatter
 
 // Skill is one loaded SKILL.md.
 type Skill struct {
@@ -158,39 +162,6 @@ func (l Loader) read(root string, shared bool) []Skill {
 	// that changes for no reason, which defeats every provider's prompt cache.
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
-}
-
-// Frontmatter pulls `name` and `description` out of a SKILL.md.
-//
-// Deliberately NOT a YAML parser. picoclaw's own validator rejects any
-// frontmatter field other than these two (apply.go, validateAppliedSkillBody),
-// so the grammar this has to read is two `key: value` lines between `---`
-// fences -- and a YAML dependency for that would be the only third-party import
-// in a module that has none.
-func Frontmatter(body string) (name, description string) {
-	rest, ok := strings.CutPrefix(strings.TrimLeft(body, "\ufeff \t\r\n"), "---")
-	if !ok {
-		return "", ""
-	}
-	rest = strings.TrimPrefix(rest, "\n")
-	end := strings.Index(rest, "\n---")
-	if end < 0 {
-		return "", ""
-	}
-	for _, line := range strings.Split(rest[:end], "\n") {
-		k, v, found := strings.Cut(line, ":")
-		if !found {
-			continue
-		}
-		v = strings.Trim(strings.TrimSpace(v), `"'`)
-		switch strings.TrimSpace(k) {
-		case "name":
-			name = v
-		case "description":
-			description = v
-		}
-	}
-	return name, description
 }
 
 // Index renders the prompt fragment.
