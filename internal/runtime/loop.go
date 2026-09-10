@@ -131,44 +131,51 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	window = dropOrphanTools(window)
 	window.Messages = append(window.Messages, in)
 
-	var answer string
+	// What the member sees, accumulated across every iteration of this turn.
+	//
+	// The transcript records ONE assistant message per turn, holding exactly
+	// this. That is not a simplification -- it is what makes the served
+	// history match the stream.
+	//
+	// The stream is one continuous run of content: an iteration's narration,
+	// then tool progress, then the next iteration's text, all into one bubble.
+	// Writing the transcript per iteration instead produced a DIFFERENT shape
+	// -- crab-shell-proxy marks an assistant message carrying tool_calls as a
+	// "step" -- so when the turn ended and the client reconciled against the
+	// transcript, the single bubble was torn into narration plus answer and
+	// the whole reply visibly rewrote itself.
+	//
+	// Tool calls and results still reach the PROVIDER: they go into the
+	// context window, which is a separate artifact built separately below.
+	// Only the served history is collapsed.
+	var answer strings.Builder
 	var total domain.Usage
 
 	for i := 0; i < c.MaxIterations; i++ {
-		msg, usage, err := c.complete(ctx, t, window, sink, in.CreatedAt)
+		msg, usage, err := c.complete(ctx, t, window, sink, in.CreatedAt, answer.String())
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
-			return answer, runErr
+			return answer.String(), runErr
 		}
 		total.Add(usage)
 
 		msg.CreatedAt = c.Now()
-		if err := c.Transcript.Append(ctx, t.SessionID, msg); err != nil {
-			runErr = fmt.Errorf("append assistant message: %w", err)
-			return answer, runErr
-		}
-		// D-3. The real message is durable now, so the sidecar is stale. The
-		// crash window between the two lines above and this one is exactly what
-		// answersAt makes harmless -- a reader finding both sees an assistant
-		// message at or after it and ignores the sidecar.
-		//
-		// A failed clear is deliberately ignored: it leaves a stale sidecar,
-		// which the supersession rule already renders invisible. Failing the
-		// turn here would trade a harmless leftover for a lost answer.
-		if c.Checkpoints != nil {
-			_ = c.Checkpoints.ClearPartial(ctx, t.SessionID)
-		}
+		// The WINDOW gets the message as the PROVIDER needs it: content and
+		// tool_calls together, so the tool results below answer a call it can
+		// see. The transcript gets one message for the whole turn, at the end.
 		window.Messages = append(window.Messages, msg)
-		if msg.Content != "" {
-			answer = msg.Content
-		}
+		answer.WriteString(msg.Content)
 
 		if len(msg.ToolCalls) == 0 {
+			if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
+				runErr = ferr
+				return answer.String(), runErr
+			}
 			c.recordUsage(ctx, total, t)
 			window = compact(window, c.WindowBudget)
 			runErr = c.Context.Save(ctx, t.SessionID, window)
-			return answer, runErr
+			return answer.String(), runErr
 		}
 
 		for _, call := range msg.ToolCalls {
@@ -176,7 +183,8 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			if err != nil {
 				runErr = err
 				sink.EmitError(err.Error())
-				return answer, runErr
+				_ = c.finishTurn(ctx, t, answer.String())
+				return answer.String(), runErr
 			}
 			out := domain.Message{
 				Role:       domain.RoleTool,
@@ -184,32 +192,66 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				ToolCallID: call.ID,
 				CreatedAt:  c.Now(),
 			}
-			if err := c.Transcript.Append(ctx, t.SessionID, out); err != nil {
-				runErr = fmt.Errorf("append tool result: %w", err)
-				return answer, runErr
-			}
+			// The tool result goes to the window only. The served transcript
+			// records what the member saw, and they never saw this.
 			window.Messages = append(window.Messages, out)
 		}
 
 		window = compact(window, c.WindowBudget)
 		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
 			runErr = fmt.Errorf("save context: %w", err)
-			return answer, runErr
+			_ = c.finishTurn(ctx, t, answer.String())
+			return answer.String(), runErr
 		}
 	}
 
 	// FR-5: hitting the cap must be said out loud, not inferred later.
 	c.recordUsage(ctx, total, t)
 	sink.EmitError(ErrMaxIterations.Error())
-	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
-		return answer, saveErr
+	if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
+		return answer.String(), ferr
 	}
-	return answer, nil
+	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
+		return answer.String(), saveErr
+	}
+	return answer.String(), nil
+}
+
+// finishTurn writes the turn's single assistant message and clears the
+// checkpoint that was standing in for it.
+//
+// Called on every exit path that produced text, including the failing ones:
+// a turn that died after saying something still said it.
+func (l *Loop) finishTurn(ctx context.Context, t domain.Turn, answer string) error {
+	if answer == "" {
+		// Nothing was said. Clear any checkpoint so a later reader does not
+		// resurrect a fragment of a turn that produced no answer.
+		if l.Checkpoints != nil {
+			_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
+		}
+		return nil
+	}
+	msg := domain.Message{
+		Role:      domain.RoleAssistant,
+		Content:   answer,
+		CreatedAt: l.Now(),
+	}
+	if err := l.Transcript.Append(ctx, t.SessionID, msg); err != nil {
+		return fmt.Errorf("append assistant message: %w", err)
+	}
+	// D-3. The real message is durable now, so the sidecar is stale. A failed
+	// clear is ignored: it leaves a leftover the supersession rule already
+	// hides, and failing here would trade that for a lost answer.
+	if l.Checkpoints != nil {
+		_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
+	}
+	return nil
 }
 
 // complete runs one provider call, streaming its deltas to the sink.
 func (l *Loop) complete(
-	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink, answersAt time.Time,
+	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
+	answersAt time.Time, alreadySaid string,
 ) (domain.Message, domain.Usage, error) {
 	ctx, end := l.span(ctx, "provider.complete")
 	var err error
@@ -227,7 +269,10 @@ func (l *Loop) complete(
 	}
 	defer stream.Close()
 
+	// Seeded with what earlier iterations of this turn already said, so a
+	// checkpoint recovers the whole answer rather than only its last leg.
 	var partial strings.Builder
+	partial.WriteString(alreadySaid)
 	lastCheckpoint := l.Now()
 
 	// Deltas are COALESCED before they reach the sink, and that is not an

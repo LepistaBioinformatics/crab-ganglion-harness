@@ -104,46 +104,57 @@ func TestRun_AppendsUserMessageBeforeCallingProvider(t *testing.T) {
 	}
 }
 
-// FR-9, the invariant that came from measured evidence: compaction rewrites the
-// window and must never shorten the transcript.
+// FR-9, the invariant that came from measured evidence: compaction rewrites
+// the window and must never shorten the transcript.
+//
+// The transcript now holds ONE assistant message per turn -- what the member
+// saw -- so the count is 2, not 4. Tool calls and results live in the window,
+// which is what the provider reads. The property under test is unchanged:
+// compacting must not remove anything from the served history.
 func TestRun_CompactionNeverShortensTheTranscript(t *testing.T) {
 	tr := &fakeTranscript{}
 	cs := &fakeContext{}
-	// Two iterations: a tool call, then an answer.
 	p := &fakeProvider{turns: []fakeTurn{
-		{msg: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "sh", Args: args(`{}`)}}}},
+		{msg: domain.Message{Role: domain.RoleAssistant, Content: "vou ver. ", ToolCalls: []domain.ToolCall{{ID: "1", Name: "sh", Args: args(`{}`)}}}},
 		{msg: domain.Message{Role: domain.RoleAssistant, Content: "pronto"}},
 	}}
 	l := newLoop(p, tr, cs, &fakeTools{result: domain.Result{Content: "saida"}}, nil)
 	l.WindowBudget = 1 // force compaction on every save
 
-	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
+	got, err := l.Run(context.Background(), turn(), domain.Sink{})
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	// user + assistant(tool) + tool result + assistant(answer)
-	if len(tr.log) != 4 {
-		t.Errorf("transcript has %d entries, want 4 -- compaction reached the transcript", len(tr.log))
+	if got != "vou ver. pronto" {
+		t.Errorf("answer = %q, want every iteration's text", got)
+	}
+	if len(tr.log) != 2 {
+		t.Errorf("transcript has %d entries, want user + one assistant: %+v", len(tr.log), tr.log)
+	}
+	if tr.log[1].Content != "vou ver. pronto" {
+		t.Errorf("served message = %q; it must be what was streamed", tr.log[1].Content)
 	}
 	last := cs.saved[len(cs.saved)-1]
 	if len(last.Messages) > 1 {
 		t.Errorf("window kept %d messages against a budget of 1", len(last.Messages))
 	}
-	if last.Summary == "" {
-		t.Error("compaction dropped messages without recording that it did")
-	}
 }
 
 // FR-7 + DEC-2: a denial is a Result the agent reacts to, not a turn failure.
+//
+// "The agent" means the provider, so the denial must land in the WINDOW. It is
+// deliberately not in the transcript: the member never saw a tool result, and
+// the transcript records what they saw.
 func TestRun_DeniedActionBecomesAToolResultAndTheTurnContinues(t *testing.T) {
 	tr := &fakeTranscript{}
+	cs := &fakeContext{}
 	tl := &fakeTools{result: domain.Result{Content: "should not run"}}
 	p := &fakeProvider{turns: []fakeTurn{
 		{msg: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "rm", Args: args(`{}`)}}}},
 		{msg: domain.Message{Role: domain.RoleAssistant, Content: "entendi, nao vou fazer isso"}},
 	}}
 	ap := &fakeApprover{dec: domain.Decision{Allowed: false, Reason: "fora da politica"}}
-	l := newLoop(p, tr, &fakeContext{}, tl, ap)
+	l := newLoop(p, tr, cs, tl, ap)
 
 	got, err := l.Run(context.Background(), turn(), domain.Sink{})
 	if err != nil {
@@ -156,13 +167,13 @@ func TestRun_DeniedActionBecomesAToolResultAndTheTurnContinues(t *testing.T) {
 		t.Errorf("the tool ran despite being denied: %+v", tl.invoked)
 	}
 	var toolMsg *domain.Message
-	for i := range tr.log {
-		if tr.log[i].Role == domain.RoleTool {
-			toolMsg = &tr.log[i]
+	for i := range cs.w.Messages {
+		if cs.w.Messages[i].Role == domain.RoleTool {
+			toolMsg = &cs.w.Messages[i]
 		}
 	}
 	if toolMsg == nil {
-		t.Fatal("no tool result was recorded for the denied call")
+		t.Fatal("the denial never reached the window, so the agent was never told")
 	}
 	if !strings.Contains(toolMsg.Content, "fora da politica") {
 		t.Errorf("the agent was not told WHY it was denied: %q", toolMsg.Content)
@@ -234,8 +245,10 @@ func TestRun_IterationCapIsReportedAndPartialWorkSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hitting the cap must not error the turn: %v", err)
 	}
-	if got != "pensando" {
-		t.Errorf("partial work was discarded: %q", got)
+	// Three iterations, each saying "pensando": the turn's answer is all of
+	// what was streamed, which is what the member watched appear.
+	if got != "pensandopensandopensando" {
+		t.Errorf("partial work was discarded or duplicated: %q", got)
 	}
 	if len(c.errs) == 0 || !strings.Contains(c.errs[0], "iteration cap") {
 		t.Errorf("the cap was hit silently: %v", c.errs)
