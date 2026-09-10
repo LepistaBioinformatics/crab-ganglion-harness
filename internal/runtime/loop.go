@@ -124,6 +124,11 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		runErr = fmt.Errorf("load context: %w", err)
 		return "", runErr
 	}
+	// Repair on load, not only on save. A window saved with an orphaned tool
+	// result -- by a build that predates dropOrphanTools -- would otherwise
+	// fail at the provider on every turn forever, because nothing else ever
+	// revisits the front of the window.
+	window = dropOrphanTools(window)
 	window.Messages = append(window.Messages, in)
 
 	var answer string
