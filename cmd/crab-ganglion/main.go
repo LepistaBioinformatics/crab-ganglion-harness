@@ -44,6 +44,7 @@ func main() {
 		Transcript:      jsonl.New(filepath.Join(cfg.DataDir, "sessions")),
 		Context:         window.New(filepath.Join(cfg.DataDir, "windows")),
 		Tools:           tool.NewRegistry(exec.New(workspace)),
+		Model:           cfg.Model,
 		System:          systemPrompt(cfg, logger),
 		MaxIterations:   cfg.MaxTurnIter,
 		ApprovalTimeout: cfg.ApprovalTimeout,

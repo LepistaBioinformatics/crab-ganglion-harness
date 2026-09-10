@@ -38,6 +38,20 @@ type Loop struct {
 	Approver   domain.Approver
 	Telemetry  domain.Telemetry
 
+	// Model is the model this harness was configured with, and it is what
+	// every turn uses.
+	//
+	// The turn's own Model field is deliberately IGNORED in v1. The proxy fills
+	// it with a placeholder -- literally "picoclaw", the harness name, because
+	// that is what its /v1/models advertises and what a client echoes back --
+	// and forwarding that to a provider gets:
+	//
+	//   The supported API model names are deepseek-flash, deepseek-v4-pro,
+	//   but you passed picoclaw.
+	//
+	// Per-turn model selection is DF-4, deferred and answered 501 by the proxy,
+	// so there is nothing to honour yet. When it lands, this is where it goes.
+	Model             string
 	System            string
 	MaxIterations     int
 	ApprovalTimeout   time.Duration
@@ -173,7 +187,7 @@ func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sin
 	defer func() { end(err) }()
 
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
-		Model:    t.Model,
+		Model:    l.modelFor(t),
 		Window:   w,
 		System:   l.System,
 		Tools:    l.Tools.Available(ctx),
@@ -271,6 +285,18 @@ func (l *Loop) approve(ctx context.Context, t domain.Turn, call domain.ToolCall,
 	}
 }
 
+// modelFor resolves the model for a turn. See Loop.Model for why the turn's
+// own label is not trusted.
+func (l *Loop) modelFor(t domain.Turn) string {
+	if l.Model != "" {
+		return l.Model
+	}
+	// No configured model: fall back to whatever the turn named, so a
+	// misconfiguration surfaces as the provider's own error naming the bad
+	// value rather than as an empty-model request nobody can attribute.
+	return t.Model
+}
+
 func (l *Loop) span(ctx context.Context, name string, attrs ...domain.Attr) (context.Context, func(error)) {
 	return l.Telemetry.Span(ctx, name, attrs...)
 }
@@ -278,6 +304,6 @@ func (l *Loop) span(ctx context.Context, name string, attrs ...domain.Attr) (con
 func (l *Loop) recordUsage(ctx context.Context, u domain.Usage, t domain.Turn) {
 	l.Telemetry.Usage(ctx, u,
 		domain.Attr{Key: "session.id", Value: t.SessionID},
-		domain.Attr{Key: "model", Value: t.Model},
+		domain.Attr{Key: "model", Value: l.modelFor(t)},
 	)
 }

@@ -262,3 +262,46 @@ func (f *fakeTelemetry) Usage(_ context.Context, u domain.Usage, _ ...domain.Att
 		f.onUsage(u)
 	}
 }
+
+// The turn's model label is a PROXY placeholder, not a provider model name.
+//
+// crab-shell-proxy fills it with "picoclaw" -- the harness name -- because
+// that is what its /v1/models advertises and what a client echoes back.
+// Forwarding it to a real provider produced, on the first live turn:
+//
+//	The supported API model names are deepseek-flash, deepseek-v4-pro,
+//	but you passed picoclaw.
+func TestRun_UsesTheConfiguredModelNotTheTurnLabel(t *testing.T) {
+	var sawModel string
+	p := &fakeProvider{turns: []fakeTurn{{msg: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}}}
+	p.onComplete = func(c domain.Completion) { sawModel = c.Model }
+
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	l.Model = "deepseek-chat"
+
+	turn := turn()
+	turn.Model = "picoclaw" // what the proxy actually sends
+	if _, err := l.Run(context.Background(), turn, domain.Sink{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sawModel != "deepseek-chat" {
+		t.Errorf("provider was asked for %q, want the configured %q", sawModel, "deepseek-chat")
+	}
+}
+
+// With no configured model, the turn's label is used -- so a misconfiguration
+// surfaces as the provider naming the bad value, not as an empty-model request
+// nobody can attribute.
+func TestRun_FallsBackToTheTurnLabelWhenUnconfigured(t *testing.T) {
+	var sawModel string
+	p := &fakeProvider{turns: []fakeTurn{{msg: domain.Message{Role: domain.RoleAssistant, Content: "ok"}}}}
+	p.onComplete = func(c domain.Completion) { sawModel = c.Model }
+
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sawModel != "deepseek-chat" { // turn()'s own label
+		t.Errorf("model = %q, want the turn's label as fallback", sawModel)
+	}
+}

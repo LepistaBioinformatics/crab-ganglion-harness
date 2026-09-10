@@ -14,9 +14,10 @@ import (
 // port split, so it is asserted here by construction.
 
 type fakeProvider struct {
-	turns []fakeTurn // one per Complete call, in order
-	calls int
-	err   error
+	turns      []fakeTurn // one per Complete call, in order
+	calls      int
+	err        error
+	onComplete func(domain.Completion)
 }
 
 type fakeTurn struct {
@@ -26,7 +27,10 @@ type fakeTurn struct {
 	err    error
 }
 
-func (p *fakeProvider) Complete(context.Context, domain.Completion) (domain.Stream, error) {
+func (p *fakeProvider) Complete(_ context.Context, c domain.Completion) (domain.Stream, error) {
+	if p.onComplete != nil {
+		p.onComplete(c)
+	}
 	if p.err != nil {
 		return nil, p.err
 	}
