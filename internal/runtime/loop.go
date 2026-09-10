@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -17,6 +18,9 @@ const (
 	DefaultApprovalTimeout   = 5 * time.Minute
 	DefaultApprovalHeartbeat = 10 * time.Second
 	DefaultWindowBudget      = 40
+	// DefaultCheckpointEvery is a WALL CLOCK, not a token count: a fast stream
+	// must not checkpoint per token, and a slow one must still checkpoint.
+	DefaultCheckpointEvery = 2 * time.Second
 )
 
 // ErrMaxIterations is returned inside the turn's report when the loop stopped
@@ -33,10 +37,13 @@ var ErrMaxIterations = errors.New("iteration cap reached before the agent finish
 type Loop struct {
 	Provider   domain.Provider
 	Transcript domain.TranscriptStore
-	Context    domain.ContextStore
-	Tools      domain.ToolExecutor
-	Approver   domain.Approver
-	Telemetry  domain.Telemetry
+	// Checkpoints may be nil: a store that cannot checkpoint simply does not,
+	// and the turn behaves as it did before D-2.
+	Checkpoints domain.Checkpointer
+	Context     domain.ContextStore
+	Tools       domain.ToolExecutor
+	Approver    domain.Approver
+	Telemetry   domain.Telemetry
 
 	// Model is the model this harness was configured with, and it is what
 	// every turn uses.
@@ -57,6 +64,7 @@ type Loop struct {
 	ApprovalTimeout   time.Duration
 	ApprovalHeartbeat time.Duration
 	WindowBudget      int
+	CheckpointEvery   time.Duration
 
 	// Now is injectable so tests do not sleep.
 	Now func() time.Time
@@ -75,6 +83,9 @@ func (l *Loop) withDefaults() *Loop {
 	}
 	if c.WindowBudget <= 0 {
 		c.WindowBudget = DefaultWindowBudget
+	}
+	if c.CheckpointEvery <= 0 {
+		c.CheckpointEvery = DefaultCheckpointEvery
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -119,7 +130,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	var total domain.Usage
 
 	for i := 0; i < c.MaxIterations; i++ {
-		msg, usage, err := c.complete(ctx, t, window, sink)
+		msg, usage, err := c.complete(ctx, t, window, sink, in.CreatedAt)
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
@@ -131,6 +142,17 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		if err := c.Transcript.Append(ctx, t.SessionKey, msg); err != nil {
 			runErr = fmt.Errorf("append assistant message: %w", err)
 			return answer, runErr
+		}
+		// D-3. The real message is durable now, so the sidecar is stale. The
+		// crash window between the two lines above and this one is exactly what
+		// answersAt makes harmless -- a reader finding both sees an assistant
+		// message at or after it and ignores the sidecar.
+		//
+		// A failed clear is deliberately ignored: it leaves a stale sidecar,
+		// which the supersession rule already renders invisible. Failing the
+		// turn here would trade a harmless leftover for a lost answer.
+		if c.Checkpoints != nil {
+			_ = c.Checkpoints.ClearPartial(ctx, t.SessionKey)
 		}
 		window.Messages = append(window.Messages, msg)
 		if msg.Content != "" {
@@ -181,7 +203,9 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 }
 
 // complete runs one provider call, streaming its deltas to the sink.
-func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink) (domain.Message, domain.Usage, error) {
+func (l *Loop) complete(
+	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink, answersAt time.Time,
+) (domain.Message, domain.Usage, error) {
 	ctx, end := l.span(ctx, "provider.complete")
 	var err error
 	defer func() { end(err) }()
@@ -198,6 +222,8 @@ func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sin
 	}
 	defer stream.Close()
 
+	var partial strings.Builder
+	lastCheckpoint := l.Now()
 	for {
 		d, nerr := stream.Next(ctx)
 		if errors.Is(nerr, io.EOF) {
@@ -207,10 +233,28 @@ func (l *Loop) complete(ctx context.Context, t domain.Turn, w domain.Window, sin
 			err = fmt.Errorf("provider stream: %w", nerr)
 			return domain.Message{}, domain.Usage{}, err
 		}
-		// FR-2: content reaches the client as the model produces it.
+		// FR-2: content reaches the client as the model produces it. The sink
+		// comes FIRST -- D-5: durability must never delay delivery.
 		sink.EmitContent(d.Content)
 		if d.Reasoning != "" {
 			sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: d.Reasoning})
+		}
+		partial.WriteString(d.Content)
+
+		// D-2. On the delta path rather than in a goroutine: an 887us write
+		// every 2s of streaming is 0.04% of that window, so there is nothing
+		// to parallelise and a second writer would need a lock for no gain.
+		if l.Checkpoints != nil && partial.Len() > 0 &&
+			l.Now().Sub(lastCheckpoint) >= l.CheckpointEvery {
+			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionKey, answersAt, partial.String()); cerr != nil {
+				// A failed checkpoint must not fail the turn: it costs recovery
+				// of THIS answer, and failing here would cost the answer itself.
+				sink.EmitProgress(domain.Progress{
+					Kind: domain.ProgressPlaceholder,
+					Text: "could not checkpoint this answer: " + cerr.Error(),
+				})
+			}
+			lastCheckpoint = l.Now()
 		}
 	}
 	return stream.Message(), stream.Usage(), nil

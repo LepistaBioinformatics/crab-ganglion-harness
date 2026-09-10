@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // The ports. Adapters implement these; the runtime depends on nothing else.
 //
@@ -34,6 +37,19 @@ type Stream interface {
 type TranscriptStore interface {
 	Append(ctx context.Context, key SessionKey, m Message) error
 	Read(ctx context.Context, key SessionKey) ([]Message, error)
+}
+
+// Checkpointer records an answer that is still streaming, so a turn that dies
+// mid-stream does not lose what the member already watched appear.
+//
+// Separate from TranscriptStore on purpose. TranscriptStore's whole value is
+// that it CANNOT rewrite anything; a checkpoint is rewritten constantly. Two
+// interfaces keep that distinction enforceable instead of a comment -- and a
+// store that cannot checkpoint stays usable, which is what the loop's
+// nil-check relies on.
+type Checkpointer interface {
+	Checkpoint(ctx context.Context, key SessionKey, answersAt time.Time, content string) error
+	ClearPartial(ctx context.Context, key SessionKey) error
 }
 
 // ContextStore holds the derived window. Rewriting it is normal and lossless in

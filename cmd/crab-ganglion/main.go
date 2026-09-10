@@ -34,15 +34,27 @@ func main() {
 		logger.Fatalf("config: %v", err)
 	}
 
+	// H-1. Everything lives under the "workspace" segment, because that is where
+	// crab-shell-proxy already looks: config.SessionsDir resolves to
+	// <userDir>/<segment>/sessions, and the mount puts <userDir> at DataDir.
+	//
+	// Writing one level shallower -- which is what this did first -- produced a
+	// transcript nothing could read: reloading a conversation returned an empty
+	// history, because the proxy was looking in a directory the harness never
+	// wrote to. Durability is worth nothing without a reader.
 	workspace := filepath.Join(cfg.DataDir, "workspace")
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		logger.Fatalf("workspace: %v", err)
 	}
 
+	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
 	loop := &runtime.Loop{
-		Provider:        openai.New(cfg.BaseURL, cfg.APIKey, nil),
-		Transcript:      jsonl.New(filepath.Join(cfg.DataDir, "sessions")),
-		Context:         window.New(filepath.Join(cfg.DataDir, "windows")),
+		Provider:   openai.New(cfg.BaseURL, cfg.APIKey, nil),
+		Transcript: transcript,
+		// Same store, second port: it appends AND checkpoints, but the loop
+		// only ever sees the narrow interface for each job.
+		Checkpoints:     transcript,
+		Context:         window.New(filepath.Join(workspace, "windows")),
 		Tools:           tool.NewRegistry(exec.New(workspace)),
 		Model:           cfg.Model,
 		System:          systemPrompt(cfg, logger),

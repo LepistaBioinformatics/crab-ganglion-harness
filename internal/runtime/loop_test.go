@@ -305,3 +305,87 @@ func TestRun_FallsBackToTheTurnLabelWhenUnconfigured(t *testing.T) {
 		t.Errorf("model = %q, want the turn's label as fallback", sawModel)
 	}
 }
+
+// D-2/D-3, from the loop's side. The store's own tests cover the supersession
+// rule; these cover that the loop drives it at all, and cleans up after itself.
+type fakeCheckpoints struct {
+	writes  []string
+	cleared int
+	err     error
+}
+
+func (f *fakeCheckpoints) Checkpoint(_ context.Context, _ domain.SessionKey, _ time.Time, content string) error {
+	f.writes = append(f.writes, content)
+	return f.err
+}
+
+func (f *fakeCheckpoints) ClearPartial(context.Context, domain.SessionKey) error {
+	f.cleared++
+	return nil
+}
+
+func TestRun_CheckpointsWhileStreamingAndClearsWhenDone(t *testing.T) {
+	cp := &fakeCheckpoints{}
+	p := &fakeProvider{turns: []fakeTurn{{
+		deltas: []string{"um", " dois", " tres"},
+		msg:    domain.Message{Role: domain.RoleAssistant, Content: "um dois tres"},
+	}}}
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	l.Checkpoints = cp
+	l.CheckpointEvery = time.Second
+	// An ADVANCING clock. newLoop freezes time so tests do not sleep, but the
+	// checkpoint cadence is a wall clock by design (D-5) -- a frozen one never
+	// fires, which is correct behaviour and a useless test.
+	tick := time.Unix(0, 0)
+	l.Now = func() time.Time { tick = tick.Add(2 * time.Second); return tick }
+
+	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(cp.writes) == 0 {
+		t.Fatal("nothing was checkpointed during a multi-delta stream")
+	}
+	// Each checkpoint carries the answer SO FAR, not just the latest delta --
+	// a partial that held one fragment would recover nothing useful.
+	last := cp.writes[len(cp.writes)-1]
+	if last != "um dois" && last != "um dois tres" {
+		t.Errorf("last checkpoint = %q, want the accumulated answer", last)
+	}
+	if cp.cleared == 0 {
+		t.Error("the sidecar was never cleared after the answer landed")
+	}
+}
+
+// A checkpoint failure costs recovery of one answer. Failing the turn over it
+// would cost the answer itself.
+func TestRun_ACheckpointFailureDoesNotFailTheTurn(t *testing.T) {
+	cp := &fakeCheckpoints{err: errors.New("disk full")}
+	p := &fakeProvider{turns: []fakeTurn{{
+		deltas: []string{"a", "b"},
+		msg:    domain.Message{Role: domain.RoleAssistant, Content: "ab"},
+	}}}
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	l.Checkpoints = cp
+	l.CheckpointEvery = time.Second
+	tick := time.Unix(0, 0)
+	l.Now = func() time.Time { tick = tick.Add(2 * time.Second); return tick }
+
+	got, err := l.Run(context.Background(), turn(), domain.Sink{})
+	if err != nil {
+		t.Fatalf("a failed checkpoint must not fail the turn: %v", err)
+	}
+	if got != "ab" {
+		t.Errorf("answer = %q", got)
+	}
+}
+
+// Nil Checkpointer: the turn behaves exactly as it did before D-2.
+func TestRun_WorksWithNoCheckpointer(t *testing.T) {
+	p := &fakeProvider{turns: []fakeTurn{{
+		deltas: []string{"ok"}, msg: domain.Message{Role: domain.RoleAssistant, Content: "ok"},
+	}}}
+	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
+	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
