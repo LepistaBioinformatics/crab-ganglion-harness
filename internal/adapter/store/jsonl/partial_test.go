@@ -115,3 +115,86 @@ func TestCheckpoint_DoesNotTouchTheTranscript(t *testing.T) {
 		t.Errorf("the transcript gained %d entries from a checkpoint", len(msgs)-1)
 	}
 }
+
+// The recovery cycle, end to end: a turn died mid-stream, the process restarts,
+// and the interrupted answer becomes an ordinary message.
+func TestRecoverPartials_FoldsAnInterruptedAnswer(t *testing.T) {
+	s := New(t.TempDir())
+	ctx := context.Background()
+	asked := time.Now()
+
+	s.Append(ctx, "sk", domain.Message{Role: domain.RoleUser, Content: "explique", CreatedAt: asked})
+	s.Checkpoint(ctx, "sk", asked, "comecei a responder e")
+	// crash here: no assistant message was ever appended
+
+	folded, dropped, err := s.RecoverPartials(ctx)
+	if err != nil {
+		t.Fatalf("RecoverPartials: %v", err)
+	}
+	if folded != 1 || dropped != 0 {
+		t.Fatalf("folded=%d dropped=%d, want 1/0", folded, dropped)
+	}
+
+	msgs, _ := s.Read(ctx, "sk")
+	if len(msgs) != 2 || msgs[1].Role != domain.RoleAssistant {
+		t.Fatalf("transcript = %+v", msgs)
+	}
+	if msgs[1].Content != "comecei a responder e" {
+		t.Errorf("recovered content = %q", msgs[1].Content)
+	}
+	// Folding must be idempotent: the sidecar is gone, so a second start does
+	// not append the same answer again.
+	if _, _, err := s.RecoverPartials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := s.Read(ctx, "sk"); len(again) != 2 {
+		t.Errorf("a second recovery duplicated the answer: %d entries", len(again))
+	}
+}
+
+// A sidecar left behind after the answer landed is dropped, not folded --
+// folding it would show the answer twice.
+func TestRecoverPartials_DropsAStaleSidecar(t *testing.T) {
+	s := New(t.TempDir())
+	ctx := context.Background()
+	asked := time.Now()
+
+	s.Append(ctx, "sk", domain.Message{Role: domain.RoleUser, Content: "oi", CreatedAt: asked})
+	s.Checkpoint(ctx, "sk", asked, "resposta pela met")
+	s.Append(ctx, "sk", domain.Message{
+		Role: domain.RoleAssistant, Content: "resposta completa", CreatedAt: asked.Add(time.Second),
+	})
+
+	folded, dropped, err := s.RecoverPartials(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folded != 0 || dropped != 1 {
+		t.Errorf("folded=%d dropped=%d, want 0/1", folded, dropped)
+	}
+	if msgs, _ := s.Read(ctx, "sk"); len(msgs) != 2 {
+		t.Errorf("the stale sidecar was folded in: %d entries", len(msgs))
+	}
+}
+
+// A checkpoint that caught no text is not data.
+func TestRecoverPartials_DropsAnEmptyCheckpoint(t *testing.T) {
+	s := New(t.TempDir())
+	ctx := context.Background()
+	s.Checkpoint(ctx, "sk", time.Now(), "   ")
+
+	folded, dropped, err := s.RecoverPartials(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folded != 0 || dropped != 1 {
+		t.Errorf("folded=%d dropped=%d, want 0/1", folded, dropped)
+	}
+}
+
+func TestRecoverPartials_NoSessionsDirIsNotAnError(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "nope"))
+	if _, _, err := s.RecoverPartials(context.Background()); err != nil {
+		t.Errorf("a first-ever start must not fail: %v", err)
+	}
+}

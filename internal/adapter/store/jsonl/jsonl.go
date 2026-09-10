@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,6 +221,72 @@ func (s *Store) Read(_ context.Context, key domain.SessionKey) ([]domain.Message
 		return out, fmt.Errorf("scan transcript: %w", err)
 	}
 	return out, nil
+}
+
+// RecoverPartials folds interrupted answers into the transcript and drops the
+// stale sidecars, returning how many of each it handled.
+//
+// Run at start, which under scale-to-zero is "the turn after the crash". It is
+// what makes recovery PERMANENT: until it runs, a live sidecar is visible only
+// because readers fold it on the fly, and it would never enter the context the
+// model sees on the next turn. After it runs, the interrupted answer is an
+// ordinary message and nothing special reads it.
+//
+// The partial's text is appended as-is, with no marker. It is what the member
+// watched appear; an answer cut mid-sentence already reads as cut, and a marker
+// field would be invisible to internal/history's parser anyway (H-2).
+func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err error) {
+	entries, rerr := os.ReadDir(s.Root)
+	if os.IsNotExist(rerr) {
+		return 0, 0, nil
+	}
+	if rerr != nil {
+		return 0, 0, fmt.Errorf("scan sessions: %w", rerr)
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".partial.json") {
+			continue
+		}
+		key := domain.SessionKey(strings.TrimSuffix(name, ".partial.json"))
+
+		p, live, perr := s.ReadPartial(ctx, key)
+		if perr != nil {
+			// One unreadable sidecar must not stop the others from being
+			// recovered -- this runs at boot, and a boot that fails on a
+			// leftover file is worse than the leftover.
+			continue
+		}
+		if !live {
+			if s.ClearPartial(ctx, key) == nil {
+				dropped++
+			}
+			continue
+		}
+		if strings.TrimSpace(p.Content) == "" {
+			// A checkpoint that caught nothing. Dropping it is not data loss.
+			if s.ClearPartial(ctx, key) == nil {
+				dropped++
+			}
+			continue
+		}
+		msg := domain.Message{
+			Role:    domain.RoleAssistant,
+			Content: p.Content,
+			// The instant the checkpoint was taken, not now: this message
+			// belongs to the turn that died, and dating it now would place it
+			// after messages that came later.
+			CreatedAt: p.UpdatedAt,
+		}
+		if aerr := s.Append(ctx, key, msg); aerr != nil {
+			continue // leave the sidecar; the next start tries again
+		}
+		if s.ClearPartial(ctx, key) == nil {
+			folded++
+		}
+	}
+	return folded, dropped, nil
 }
 
 // safe keeps a session key from escaping Root. Keys come from the proxy, but a

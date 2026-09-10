@@ -67,6 +67,15 @@ func main() {
 		loop.Approver = proxy.New(cfg.ApprovalEndpoint, cfg.AuthToken, cfg.GatedTools, nil)
 	}
 
+	// Recovery runs before the first turn is served. Under scale-to-zero this
+	// start IS the turn after a crash, so an interrupted answer becomes an
+	// ordinary message before the model is asked to continue the conversation.
+	if folded, dropped, err := transcript.RecoverPartials(context.Background()); err != nil {
+		logger.Printf("partial recovery: %v", err)
+	} else if folded > 0 || dropped > 0 {
+		logger.Printf("recovered %d interrupted answer(s), dropped %d stale checkpoint(s)", folded, dropped)
+	}
+
 	var ingress domain.Ingress = httpsse.New(cfg.Addr, cfg.AuthToken)
 	if s, ok := ingress.(*httpsse.Server); ok {
 		s.Logf = logger.Printf
