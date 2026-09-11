@@ -22,6 +22,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/approver/proxy"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/evolution"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/httpsse"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/mcp"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/openai"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/skills"
@@ -151,7 +152,28 @@ func main() {
 	// runner holds a POINTER, so by the time a child is actually started the
 	// tool set below is in place -- including, at depths under the cap, the
 	// dispatcher itself.
-	loop.Tools = tool.NewRegistry(tools(workspace, self, reg, subAgent(loop, reg), logger)...)
+	builtin := tools(workspace, self, reg, subAgent(loop, reg), logger)
+	// The memory graph, and anything else an operator mounted over MCP. Placed
+	// AFTER the built-ins so the collision check below has the whole set to
+	// compare against, and CLOSED at shutdown so the server can release the
+	// session -- a scale-to-zero agent opens one per cold start.
+	remote, closers, err := mcpTools(context.Background(), reg, builtin, logger)
+	if err != nil {
+		// FATAL, for the reason evolution's failures are: a config that SAYS
+		// the agent has a memory and cannot give it one leaves the operator
+		// believing in a capability nothing provides. That is the failure the
+		// proxy's whole harness-gate table exists to prevent, and it would be
+		// invisible from inside the container.
+		logger.Fatalf("mcp: %v", err)
+	}
+	for _, c := range closers {
+		defer func(c *mcp.Client) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = c.Close(ctx)
+		}(c)
+	}
+	loop.Tools = tool.NewRegistry(append(builtin, remote...)...)
 	// FR-10. Unset endpoint means the exporter posts nothing, so a deployment
 	// without a collector behaves exactly as before rather than logging a
 	// failed request per turn.
@@ -470,4 +492,68 @@ func windowStore(workspace, projects string) *window.Store {
 	w := window.New(filepath.Join(workspace, "windows"))
 	w.Projects = projects
 	return w
+}
+
+// mcpTools connects every configured MCP server and returns the tools it
+// offers, plus the clients to close at shutdown.
+//
+// Two boot refusals, and both are about the same thing: an agent must never be
+// told it has a capability it does not have.
+//
+//   - A server that cannot be reached or listed. Carrying on would give the
+//     agent a memory-shaped hole, and every turn after it would look like a
+//     model choosing not to remember.
+//   - A name that collides with a built-in. Registry.Register OVERWRITES, so a
+//     remote server offering "shell" would silently replace the sandboxed one
+//     with whatever it does -- which is not a thing that should be possible,
+//     whoever wrote the config.
+//
+// Order is the configuration's (config.loadMCP sorts the servers), so the tool
+// list the model sees is stable across boots.
+// How long the boot waits for one MCP server, and how long a single tool call
+// may take once it is connected.
+//
+// The connect budget is the shorter of the two on purpose: it runs on every cold
+// start of a scale-to-zero agent, and a member is waiting on it. The call budget
+// is the agent's, mid-turn, with nobody blocked on the handshake.
+const (
+	mcpConnectTimeout = 10 * time.Second
+	mcpCallTimeout    = 60 * time.Second
+)
+
+func mcpTools(
+	ctx context.Context, reg config.Registry, builtin []tool.Tool, logger *log.Logger,
+) ([]tool.Tool, []*mcp.Client, error) {
+	if len(reg.MCP) == 0 {
+		return nil, nil, nil
+	}
+	taken := map[string]string{}
+	for _, t := range builtin {
+		taken[t.Name()] = "a built-in tool"
+	}
+
+	var out []tool.Tool
+	var clients []*mcp.Client
+	for _, srv := range reg.MCP {
+		// Bounded per SERVER: a server that accepts the connection and never
+		// answers would otherwise hold the boot open forever, and under
+		// scale-to-zero that is every cold start.
+		connectCtx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
+		client, remote, err := mcp.Connect(connectCtx, srv.Name, srv.URL, srv.Headers, mcpCallTimeout)
+		cancel()
+		if err != nil {
+			return nil, clients, err
+		}
+		clients = append(clients, client)
+		for _, t := range remote {
+			if owner, dup := taken[t.Name()]; dup {
+				return nil, clients, fmt.Errorf(
+					"mcp server %q offers tool %q, which is already %s", srv.Name, t.Name(), owner)
+			}
+			taken[t.Name()] = fmt.Sprintf("offered by mcp server %q", srv.Name)
+			out = append(out, t)
+		}
+		logger.Printf("mcp: server %q connected, %d tools", srv.Name, len(remote))
+	}
+	return out, clients, nil
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -184,7 +185,25 @@ type file struct {
 		Subagent *struct {
 			Enabled *bool `json:"enabled"`
 		} `json:"subagent"`
+		// MCP is picoclaw's tools.mcp block, read verbatim so the proxy's
+		// existing per-workspace writer serves both harnesses with one record.
+		// `command` is present in that shape and is always empty for an HTTP
+		// server; see loadMCP for why a non-empty one is refused rather than
+		// ignored.
+		MCP *struct {
+			Enabled *bool                `json:"enabled"`
+			Servers map[string]mcpServer `json:"servers"`
+		} `json:"mcp"`
 	} `json:"tools"`
+}
+
+// mcpServer is one entry of tools.mcp.servers, in picoclaw's own shape.
+type mcpServer struct {
+	Enabled *bool             `json:"enabled"`
+	Command string            `json:"command"`
+	Type    string            `json:"type"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
 }
 
 // webBlock is the shape shared by every provider under tools.web, plus the
@@ -265,6 +284,10 @@ type Registry struct {
 	Evolution Evolution
 	// Subturn is the sub-agent fan-out block, with defaults applied.
 	Subturn Subturn
+	// MCP is the enabled tools.mcp servers, in configuration order. Empty when
+	// the block is absent or disabled, which is every deployment that has no
+	// memory graph.
+	MCP []MCPServer
 	// Warnings are operator mistakes that are not errors: a key whose value
 	// could not be read, where refusing to boot would be worse than carrying
 	// on without it. Carried out rather than logged here because this package
@@ -580,6 +603,11 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 		return Registry{}, err
 	}
 	reg.Web = web
+	servers, err := loadMCP(f)
+	if err != nil {
+		return Registry{}, err
+	}
+	reg.MCP = servers
 	return reg, nil
 }
 
@@ -736,6 +764,73 @@ func loadEvolution(raw *struct {
 		e.MinSuccessRatio = *raw.MinSuccessRatio
 	}
 	return e
+}
+
+// MCPServer is one configured MCP server, after validation.
+//
+// Only what a client needs: this harness speaks one transport, so there is no
+// Type to carry forward -- a server that is not http never reaches here.
+type MCPServer struct {
+	// Name is the key under tools.mcp.servers. It names the server in a boot
+	// refusal and in a failed call, and is the only handle an operator has.
+	Name    string
+	URL     string
+	Headers map[string]string
+}
+
+// loadMCP reads tools.mcp.
+//
+// REFUSES rather than skips, and the distinction is the whole point. A silently
+// absent memory is the failure the proxy's harness gate table exists to prevent:
+// the agent is told nothing, remembers nothing, and looks exactly like an agent
+// that was never given a graph. An operator who wrote a server block meant it.
+//
+// Three refusals, all naming the server:
+//
+//   - a `command`, which means stdio. The ganglion container has no package
+//     manager and no way to run one, so this cannot be made to work later in the
+//     turn; it has to stop the boot.
+//   - a type that is not "http". Same reason, stated by the other field --
+//     picoclaw's own record carries `command: ""` AND `type: "http"`, so an
+//     entry missing the type was written by something else.
+//   - no url, which is an http server that names no host.
+//
+// An `enabled: false` entry, or a disabled tools.mcp block, is not a refusal:
+// that is an operator turning something off, which is an instruction rather than
+// a mistake.
+func loadMCP(f file) ([]MCPServer, error) {
+	m := f.Tools.MCP
+	if m == nil || (m.Enabled != nil && !*m.Enabled) {
+		return nil, nil
+	}
+	// Sorted, because the servers arrive in a map and the tool order they
+	// produce reaches the model's prompt. An order that changed between boots
+	// would change the prompt for no reason anyone could see.
+	names := make([]string, 0, len(m.Servers))
+	for name := range m.Servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]MCPServer, 0, len(names))
+	for _, name := range names {
+		srv := m.Servers[name]
+		if srv.Enabled != nil && !*srv.Enabled {
+			continue
+		}
+		if strings.TrimSpace(srv.Command) != "" {
+			return nil, fmt.Errorf("mcp server %q declares a command: this harness speaks only streamable HTTP, "+
+				"and the container has no way to run a stdio server", name)
+		}
+		if t := strings.TrimSpace(srv.Type); t != "http" {
+			return nil, fmt.Errorf("mcp server %q has type %q: only \"http\" is supported", name, t)
+		}
+		if strings.TrimSpace(srv.URL) == "" {
+			return nil, fmt.Errorf("mcp server %q has no url", name)
+		}
+		out = append(out, MCPServer{Name: name, URL: srv.URL, Headers: srv.Headers})
+	}
+	return out, nil
 }
 
 // loadSubturn applies the defaults, then whatever the file overrides.
