@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
 
 // protocolVersion is what this client negotiates. Sent on initialize and,
@@ -302,6 +304,18 @@ func (c *Client) do(ctx context.Context, r rpcRequest) (json.RawMessage, error) 
 	return out.Result, nil
 }
 
+// ProjectHeader tells the server which of the member's projects a call belongs
+// to.
+//
+// The same name crab-shell-proxy sends in the other direction on a turn, because
+// it is the same fact. It is set from the TURN's context, never from a tool
+// argument: the project is a property of the conversation, and a model able to
+// name it could read and write another project's memory.
+//
+// A remote server that does not know the header ignores it, which is what makes
+// this safe to send unconditionally.
+const ProjectHeader = "X-Ganglion-Project"
+
 // applyHeaders sets what every request to this server carries.
 //
 // Accept lists BOTH media types because the server chooses between them per
@@ -311,6 +325,12 @@ func (c *Client) applyHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("MCP-Protocol-Version", protocolVersion)
+	// Before the configured headers, so a server block may override it, and from
+	// the REQUEST's context, which is the turn's -- initialize and tools/list run
+	// at boot under no project and correctly send nothing.
+	if p := domain.ProjectFrom(req.Context()); p != "" {
+		req.Header.Set(ProjectHeader, p)
+	}
 	for k, v := range c.Headers {
 		req.Header.Set(k, v)
 	}
