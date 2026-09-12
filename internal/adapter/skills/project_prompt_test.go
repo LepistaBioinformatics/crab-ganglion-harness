@@ -14,7 +14,7 @@ import (
 func projectWorkspace(t *testing.T, project string, files map[string]string) string {
 	t.Helper()
 	ws := t.TempDir()
-	dir := filepath.Join(ws, domain.ProjectsDirName, project)
+	dir := domain.ProjectWorkspace(ws, project)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestThePersonaStillComesFirst(t *testing.T) {
 func TestTheCacheIsKeyedByProject(t *testing.T) {
 	ws := t.TempDir()
 	for _, name := range []string{"alpha", "beta"} {
-		dir := filepath.Join(ws, domain.ProjectsDirName, name)
+		dir := domain.ProjectWorkspace(ws, name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}

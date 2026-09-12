@@ -113,14 +113,17 @@ func main() {
 		logger.Printf("models: %s", w)
 	}
 
-	// The per-project subtrees live under the workspace, not beside it: the
-	// container binds exactly one directory, and a project must not need a
-	// second mount -- creating one would mean recreating the container, which
-	// for a scale-to-zero agent may not even be running.
-	projects := filepath.Join(workspace, domain.ProjectsDirName)
-
+	// A project's subtree is a SIBLING of the workspace -- workspace-<id> --
+	// because that is how picoclaw lays one out and therefore how the proxy
+	// reads one from outside the container. See the product repo's
+	// .claude/rules/harness-layout.md.
+	//
+	// It was a child for one release, to spare the ganglion a second bind. The
+	// proxy pays that bind now (one per project, nothing above them mounted),
+	// which is cheap for an agent whose container is created per turn anyway --
+	// and far cheaper than the second layout it was buying.
 	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
-	transcript.Projects = projects
+	transcript.Workspace = workspace
 	loop := &runtime.Loop{
 		Provider:   models,
 		Models:     models,
@@ -129,7 +132,7 @@ func main() {
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
 		Checkpoints: transcript,
-		Context:     windowStore(workspace, projects),
+		Context:     windowStore(workspace),
 		Model:       cfg.Model,
 		System:      systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{
@@ -218,6 +221,20 @@ func main() {
 	// a /tmp anyway.
 	if err := os.RemoveAll(filepath.Join(workspace, exec.TmpDirName)); err != nil {
 		logger.Printf("clear the command scratch dir: %v", err)
+	}
+
+	// BEFORE the partial recovery, which scans the projects: a subtree still at
+	// the old path would be invisible to it, and a partial nobody folds is an
+	// answer the member watched appear and then never sees again.
+	//
+	// A failure is reported and not fatal. What it means is that one project's
+	// files are still at the old path -- readable, just not where anything looks
+	// -- and refusing to boot over it would take the whole agent off the air for
+	// one project's history.
+	if moved, err := jsonl.MigrateProjects(workspace); err != nil {
+		logger.Printf("projects: migration to the sibling layout incomplete: %v", err)
+	} else if moved > 0 {
+		logger.Printf("projects: moved %d project(s) beside the workspace", moved)
 	}
 
 	if folded, dropped, err := transcript.RecoverPartials(context.Background()); err != nil {
@@ -495,9 +512,9 @@ func encrypt() error {
 // A function rather than an inline literal only because the Loop's field is
 // typed as the port, so the two assignments could not be written in one
 // expression without losing the concrete type the second one needs.
-func windowStore(workspace, projects string) *window.Store {
+func windowStore(workspace string) *window.Store {
 	w := window.New(filepath.Join(workspace, "windows"))
-	w.Projects = projects
+	w.Workspace = workspace
 	return w
 }
 

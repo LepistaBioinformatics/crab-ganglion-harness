@@ -56,18 +56,43 @@ func ProjectFrom(ctx context.Context) string {
 // reads, and the shell has to be able to see both. When they disagreed for the
 // main workspace it was a bug; per project it would be an invisible one.
 //
-// The layout is <workspace>/projects/<id>, with the main workspace as the case
-// where no project is named -- so a deployment with no projects gets the paths
-// it has always had.
+// The layout is <workspace>/../workspace-<id> -- a SIBLING of the main
+// workspace, not a child of it -- with the main workspace as the case where no
+// project is named, so a deployment with no projects gets the paths it has
+// always had.
+//
+// Sibling because picoclaw derives a named agent's workspace that way itself
+// (pkg/agent/instance.go, resolveAgentWorkspace), so the shape is a fact about
+// this stack rather than a convention either side is free to restate. The rule
+// is written down in the product repo's .claude/rules/harness-layout.md, and
+// the proxy builds exactly these paths from the outside.
+//
+// It was <workspace>/projects/<id> for one release. That bought the ganglion a
+// project with no new bind -- and cost a second layout, which cost more: every
+// path helper on the proxy side had to branch on the harness, and a branch that
+// is missing does not fail, it reads a directory that never exists and reports
+// that the member has no history.
 func ProjectRoot(ctx context.Context, workspace string) string {
 	p := ProjectFrom(ctx)
 	if p == "" || !ValidProject(p) {
 		return workspace
 	}
-	return filepath.Join(workspace, ProjectsDirName, p)
+	return ProjectWorkspace(workspace, p)
 }
 
-// ProjectsDirName is the reserved directory under the workspace that holds the
-// per-project subtrees. Reserved: a conversation or a file named "projects" in
-// the main workspace would otherwise collide with the tree.
-const ProjectsDirName = "projects"
+// ProjectWorkspace is the sibling directory for one project id.
+//
+// Separated from ProjectRoot because the boot needs it without a context: the
+// stores are built once, per project, before any turn exists.
+//
+// filepath.Dir, not a stored parent: the workspace is the one path this harness
+// is given, and deriving the sibling from it keeps a single source for both.
+func ProjectWorkspace(workspace, id string) string {
+	return filepath.Join(filepath.Dir(workspace), ProjectWorkspacePrefix+id)
+}
+
+// ProjectWorkspacePrefix is what picoclaw prepends to a project id to name its
+// workspace. Written once, because the proxy writes the same string from the
+// other side and a disagreement produces an empty directory rather than an
+// error.
+const ProjectWorkspacePrefix = "workspace-"

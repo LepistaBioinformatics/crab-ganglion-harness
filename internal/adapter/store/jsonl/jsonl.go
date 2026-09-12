@@ -37,8 +37,10 @@ var (
 // Store writes transcripts under Root.
 type Store struct {
 	Root string
-	// Projects, when set, is the parent of the per-project subtrees. See dir.
-	Projects string
+	// Workspace, when set, is the MAIN workspace directory -- the one a project's
+	// is a sibling of. Empty means this store serves no projects, which is every
+	// deployment that has none. See dir.
+	Workspace string
 
 	mu sync.Mutex
 }
@@ -250,18 +252,23 @@ func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err e
 	// Read from disk rather than from a project list, because this runs at boot
 	// and the harness has no list -- the proxy owns it, and a directory that
 	// exists is exactly the set that could hold a sidecar.
-	if s.Projects == "" {
+	if s.Workspace == "" {
 		return folded, dropped, nil
 	}
-	projects, rerr := os.ReadDir(s.Projects)
+	// The projects are SIBLINGS, so the scan is of the workspace's parent and
+	// the name prefix is what picks them out. filepath.Base(s.Workspace) is
+	// skipped by the prefix test itself -- "workspace" does not start with
+	// "workspace-".
+	siblings, rerr := os.ReadDir(filepath.Dir(s.Workspace))
 	if rerr != nil {
 		return folded, dropped, nil
 	}
-	for _, p := range projects {
-		if !p.IsDir() {
+	for _, p := range siblings {
+		id, ok := strings.CutPrefix(p.Name(), domain.ProjectWorkspacePrefix)
+		if !p.IsDir() || !ok || id == "" {
 			continue
 		}
-		pf, pd, perr := s.recoverIn(domain.WithProject(ctx, p.Name()))
+		pf, pd, perr := s.recoverIn(domain.WithProject(ctx, id))
 		if perr != nil {
 			// One unreadable project must not stop the rest, for the reason
 			// one unreadable sidecar must not: this is boot.
@@ -354,16 +361,17 @@ func safe(s string) string {
 //
 // The leaf name is taken from Root rather than configured separately, so the
 // two can never disagree: <workspace>/sessions becomes
-// <workspace>/projects/<id>/sessions, and the same store type serves windows
-// without knowing it.
+// <workspace>-<id>/sessions -- a SIBLING of the main workspace, which is how
+// picoclaw lays a project out and therefore how the proxy reads one -- and the
+// same store type serves windows without knowing it.
 //
 // safe() is applied to the project too. The ingress already refuses anything
 // outside [a-z0-9_-], and a store that trusted that would be one refactor away
 // from writing wherever a header said.
 func (s *Store) dir(ctx context.Context) string {
 	p := domain.ProjectFrom(ctx)
-	if p == "" || s.Projects == "" {
+	if p == "" || s.Workspace == "" {
 		return s.Root
 	}
-	return filepath.Join(s.Projects, safe(p), filepath.Base(s.Root))
+	return filepath.Join(domain.ProjectWorkspace(s.Workspace, safe(p)), filepath.Base(s.Root))
 }

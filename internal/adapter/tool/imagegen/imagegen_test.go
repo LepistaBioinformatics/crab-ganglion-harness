@@ -199,7 +199,7 @@ func TestAProjectsGeneratedImageLandsInThatProjectsMediaDirectory(t *testing.T) 
 	ctx := domain.WithProject(context.Background(), "seed-trial")
 	res, _ := tool.Invoke(ctx, json.RawMessage(`{"prompt":"a crab"}`))
 
-	dir := filepath.Join(ws, domain.ProjectsDirName, "seed-trial", MediaDirName)
+	dir := filepath.Join(domain.ProjectWorkspace(ws, "seed-trial"), MediaDirName)
 	files, err := os.ReadDir(dir)
 	if err != nil || len(files) != 1 {
 		t.Fatalf("nothing was written to %s (%v):\n%s", dir, err, res.Content)

@@ -332,7 +332,7 @@ func TestAProjectShellStartsAtTheProjectRoot(t *testing.T) {
 	tool := &Tool{Workdir: ws}
 
 	got := tool.projectDir(domain.WithProject(context.Background(), "seed-trial"))
-	want := filepath.Join(ws, domain.ProjectsDirName, "seed-trial")
+	want := domain.ProjectWorkspace(ws, "seed-trial")
 	if got != want {
 		t.Errorf("cwd = %q, want %q", got, want)
 	}

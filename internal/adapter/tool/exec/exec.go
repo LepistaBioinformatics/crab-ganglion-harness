@@ -146,27 +146,38 @@ func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, 
 // The first was written believing it closed the exposure. It did not, and the
 // gap was found by reading /proc/1/environ from a scrubbed child.
 func (t *Tool) command(ctx context.Context, shell, script string) *osexec.Cmd {
+	dir := t.projectDir(ctx)
 	var cmd *osexec.Cmd
 	if t.Self == "" {
 		cmd = osexec.CommandContext(ctx, shell, "-c", script)
 	} else {
-		cmd = osexec.CommandContext(ctx, t.Self, SandboxArg, t.Workdir, shell, "-c", script)
+		cmd = osexec.CommandContext(ctx, t.Self, SandboxArg, dir, shell, "-c", script)
 	}
-	// The COMMAND starts in the project's own files directory, while the
-	// SANDBOX ROOT above stays the whole workspace.
+	// THE SANDBOX ROOT IS THE TURN'S OWN WORKSPACE, and the command starts
+	// there. A project turn gets workspace-<id>; a turn outside one gets
+	// workspace/, exactly as before.
 	//
-	// Deliberately not narrowed: the shared skills the proxy mounts and the
-	// scratch directory below both live at the workspace root, and a Landlock
-	// domain confined to one project would take both away. Isolation between a
-	// member's own projects is a convention here, not a kernel boundary, and
-	// the spec says so where it is claimed.
-	cmd.Dir = t.projectDir(ctx)
+	// It could not stay the main workspace once projects became siblings of it,
+	// and it must not become their PARENT: that directory also holds config.json
+	// (the model registry, with its api_keys) and credential.key, both bound
+	// there precisely because the Landlock root ends below them. Widening the
+	// root by one level would hand a command both.
+	//
+	// So the root narrowed instead, and isolation between a member's own
+	// projects stopped being a convention and became a kernel boundary. The one
+	// thing that cost -- the admin's shared skills, which used to live only at
+	// the main workspace's root -- the proxy now mounts into every workspace,
+	// which is what picoclaw already does for its own project agents.
+	cmd.Dir = dir
 	cmd.Env = scrubEnv(os.Environ())
 
 	// Scratch space inside the workspace rather than a second writable
 	// hierarchy in the ruleset. mktemp, sort and anything else that reaches
 	// for a temporary file lands here, where the agent may already write.
-	tmp := filepath.Join(t.Workdir, TmpDirName)
+	// In the TURN'S workspace, not always the main one: a project turn writing
+	// its scratch into the main workspace would leave files in a tree it is not
+	// working in, and TMPDIR has to be somewhere the command can already write.
+	tmp := filepath.Join(dir, TmpDirName)
 	if err := os.MkdirAll(tmp, 0o755); err == nil {
 		cmd.Env = append(cmd.Env, "TMPDIR="+tmp)
 	}
