@@ -39,6 +39,9 @@ type Exporter struct {
 
 	mu      sync.Mutex
 	traceID string
+	// unsupported is the set of signal paths the collector answered 404 for.
+	// See disable.
+	unsupported map[string]bool
 }
 
 func New(endpoint, service string, hc *http.Client) *Exporter {
@@ -136,7 +139,7 @@ func (e *Exporter) Usage(ctx context.Context, u domain.Usage, attrs ...domain.At
 // lose their answer so that a counter could be recorded. A collector that is
 // down has to be invisible to them.
 func (e *Exporter) post(ctx context.Context, path string, payload any) {
-	if e.Endpoint == "" {
+	if e.Endpoint == "" || e.dropped(path) {
 		return
 	}
 	b, err := json.Marshal(payload)
@@ -157,9 +160,58 @@ func (e *Exporter) post(ctx context.Context, path string, payload any) {
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// The collector does not accept this SIGNAL, which is a permanent fact
+		// about how it is configured and not a failure to retry.
+		//
+		// An OTLP/HTTP receiver registers a route per PIPELINE. This stack's
+		// collector declares a metrics pipeline and no traces one -- deliberately,
+		// because Prometheus cannot store spans and the config records that
+		// declaring a pipeline would "advertise capability the stack does not
+		// have". So /v1/metrics answers and /v1/traces 404s, forever.
+		//
+		// Retrying it once per span meant two error lines per turn in the AGENT's
+		// own log, which is where a member-facing failure has to be visible. A
+		// permanent condition reported per occurrence is how a real failure gets
+		// missed.
+		e.disable(path)
+		return
+	}
 	if resp.StatusCode >= 300 {
 		e.logf("otlp post %s: %s", path, resp.Status)
 	}
+}
+
+// disable stops posting one signal, and says so exactly once.
+//
+// Per SIGNAL rather than per exporter: a collector that takes metrics and not
+// traces is the ordinary case here, and losing the token counts because the
+// spans have nowhere to go would give up the capability this exporter was built
+// for.
+//
+// Not persisted and not re-probed. Under scale-to-zero the process is minutes
+// old, so an operator who adds a traces pipeline gets it on the next cold start
+// without anything here having to poll for it.
+func (e *Exporter) disable(path string) {
+	e.mu.Lock()
+	if e.unsupported == nil {
+		e.unsupported = map[string]bool{}
+	}
+	already := e.unsupported[path]
+	e.unsupported[path] = true
+	e.mu.Unlock()
+	if !already {
+		e.logf("otlp: the collector at %s does not accept %s (404) -- "+
+			"no pipeline is declared for it; this signal is dropped for the rest of this process",
+			e.Endpoint, path)
+	}
+}
+
+// dropped reports whether this signal has been turned off by a 404.
+func (e *Exporter) dropped(path string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.unsupported[path]
 }
 
 // traceFor gives every span from this process one trace id.

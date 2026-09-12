@@ -3,6 +3,7 @@ package otlp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -137,5 +138,92 @@ func TestPost_NoEndpointIsSilent(t *testing.T) {
 	e.Usage(context.Background(), domain.Usage{TotalTokens: 1})
 	if logged != 0 {
 		t.Errorf("logged %d times with no endpoint configured", logged)
+	}
+}
+
+// A 404 on an OTLP signal path means the collector declares no pipeline for that
+// signal -- a permanent fact about its configuration, not a failure to retry.
+//
+// This stack's collector is exactly that case: it has a metrics pipeline and no
+// traces one, because Prometheus cannot store spans. Retrying meant two error
+// lines per turn in the AGENT's own log, which is where a member-facing failure
+// has to stay visible.
+func TestA404DropsThatSignalAndKeepsTheOthers(t *testing.T) {
+	var traces, metrics int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/traces":
+			traces++
+			w.WriteHeader(http.StatusNotFound)
+		case "/v1/metrics":
+			metrics++
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	var lines []string
+	e := New(srv.URL, "ganglion", nil)
+	e.Logf = func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+
+	for i := 0; i < 5; i++ {
+		_, end := e.Span(context.Background(), "turn")
+		end(nil)
+		e.Usage(context.Background(), domain.Usage{PromptTokens: 1, TotalTokens: 1})
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if traces != 1 {
+		t.Errorf("traces posted %d times, want 1 -- a 404 must not be retried", traces)
+	}
+	// The capability the exporter was built for keeps working. Giving up the
+	// token counts because the spans have nowhere to go would be the wrong trade.
+	if metrics != 5 {
+		t.Errorf("metrics posted %d times, want 5", metrics)
+	}
+
+	said := 0
+	for _, l := range lines {
+		if strings.Contains(l, "/v1/traces") {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("the drop was reported %d times, want exactly one line", said)
+	}
+	if said == 1 && !strings.Contains(lines[0], "does not accept") {
+		t.Errorf("the line does not say what happened: %q", lines[0])
+	}
+}
+
+// A non-404 failure is transient -- a collector restarting, a batch refused --
+// and must keep being retried and keep being reported.
+func TestAServerErrorIsStillRetried(t *testing.T) {
+	var posts int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		posts++
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	e := New(srv.URL, "ganglion", nil)
+	e.Logf = func(string, ...any) {}
+	for i := 0; i < 3; i++ {
+		_, end := e.Span(context.Background(), "turn")
+		end(nil)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if posts != 3 {
+		t.Fatalf("posts = %d, want 3: a 503 is transient and must be retried", posts)
 	}
 }
