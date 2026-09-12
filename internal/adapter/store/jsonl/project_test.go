@@ -4,17 +4,25 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
 
+// scoped builds the real shape: a dedicated parent holding the main workspace,
+// with a project's beside it. The parent is what the sibling layout derives
+// from, so a bare t.TempDir() would put projects next to whatever else is in
+// /tmp.
 func scoped(t *testing.T) (*Store, string) {
 	t.Helper()
-	ws := t.TempDir()
+	ws := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	s := New(filepath.Join(ws, "sessions"))
-	s.Projects = filepath.Join(ws, "projects")
+	s.Workspace = ws
 	return s, ws
 }
 
@@ -50,7 +58,7 @@ func TestAProjectTurnWritesUnderItsOwnSubtree(t *testing.T) {
 	if err := s.Append(ctx, "conv-1", msg("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(ws, "projects", "seed-trial", "sessions", "conv-1.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(domain.ProjectWorkspace(ws, "seed-trial"), "sessions", "conv-1.jsonl")); err != nil {
 		t.Fatalf("the project transcript is not where it should be: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(ws, "sessions", "conv-1.jsonl")); !os.IsNotExist(err) {
@@ -91,12 +99,21 @@ func TestTheStoreSanitisesTheProjectItIsGiven(t *testing.T) {
 	if err := s.Append(ctx, "conv", msg("x")); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(filepath.Join(ws, "projects"))
+	// The projects are siblings, so what a traversal would escape into is the
+	// workspace's PARENT -- and nothing but workspace-<sanitised> may appear
+	// there.
+	entries, err := os.ReadDir(filepath.Dir(ws))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == ".." || e.Name() == "etc" {
+		if e.Name() == "workspace" {
+			continue
+		}
+		if !strings.HasPrefix(e.Name(), domain.ProjectWorkspacePrefix) {
+			t.Fatalf("the store wrote to %q, outside the project naming", e.Name())
+		}
+		if strings.Contains(e.Name(), "..") || strings.Contains(e.Name(), "/") {
 			t.Fatalf("the store wrote to %q", e.Name())
 		}
 	}

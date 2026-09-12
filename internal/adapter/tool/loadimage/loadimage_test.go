@@ -23,10 +23,32 @@ func invoke(t *testing.T, tool *Tool, path string) domain.Result {
 	return res
 }
 
+// workspace builds the real shape: a dedicated parent holding the main
+// workspace, with a project's beside it.
+//
+// The parent matters. domain.WorkspaceRoot is filepath.Dir of the workspace, and
+// that is only a boundary because the parent holds nothing but this member's
+// workspaces -- in a container it is the mount destination, and the ganglion
+// binds one directory per workspace and nothing above them. A test that passed a
+// bare t.TempDir() would be measuring against /tmp and would pass whatever this
+// function did.
 func workspace(t *testing.T) string {
 	t.Helper()
-	ws := t.TempDir()
+	ws := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(ws, "photo.png"), png, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return ws
+}
+
+// emptyWorkspace is workspace() without the sample image.
+func emptyWorkspace(t *testing.T) string {
+	t.Helper()
+	ws := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return ws
@@ -157,8 +179,8 @@ func TestASubdirectoryOfTheWorkspaceIsAllowed(t *testing.T) {
 // A project turn resolves a relative path inside its own subtree, so
 // `load_image("photo.png")` in a project finds THAT project's file.
 func TestARelativePathResolvesInsideTheProject(t *testing.T) {
-	ws := t.TempDir()
-	dir := filepath.Join(ws, domain.ProjectsDirName, "seed-trial")
+	ws := emptyWorkspace(t)
+	dir := domain.ProjectWorkspace(ws, "seed-trial")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -176,13 +198,22 @@ func TestARelativePathResolvesInsideTheProject(t *testing.T) {
 	}
 }
 
-// The BOUNDARY is still the workspace, not the project. Separating a member's
-// projects from each other is a convention; claiming it is containment here
-// would make this function assert something it cannot enforce -- the shell tool
-// beside it can walk the whole tree under one Landlock domain.
-func TestTheBoundaryIsStillTheWorkspaceAndNotTheProject(t *testing.T) {
-	ws := t.TempDir()
-	other := filepath.Join(ws, domain.ProjectsDirName, "other")
+// One project cannot read another, and this test replaced its exact inverse.
+//
+// It used to assert that a project turn COULD read a sibling project's file, on
+// a reason that was true then: separating a member's projects was a convention,
+// and claiming containment here "would make this function assert something it
+// cannot enforce -- the shell tool beside it can walk the whole tree under one
+// Landlock domain."
+//
+// Both halves moved together. A project's workspace is a sibling of the main one
+// now, and the shell's Landlock root narrowed to the TURN's workspace with it --
+// it could not widen, because the directory above holds config.json and
+// credential.key. So the convention became a boundary, and this tool agrees with
+// the shell about where it is.
+func TestOneProjectCannotReadAnother(t *testing.T) {
+	ws := emptyWorkspace(t)
+	other := domain.ProjectWorkspace(ws, "other")
 	if err := os.MkdirAll(other, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -190,13 +221,13 @@ func TestTheBoundaryIsStillTheWorkspaceAndNotTheProject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	args, _ := json.Marshal(map[string]string{"path": "../other/shared.png"})
+	args, _ := json.Marshal(map[string]string{"path": "../workspace-other/shared.png"})
 	res, err := New(ws).Invoke(domain.WithProject(context.Background(), "mine"), args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Attachments) != 1 {
-		t.Fatalf("a path inside the workspace was refused: %q", res.Content)
+	if len(res.Attachments) != 0 {
+		t.Fatal("a turn in one project read another project's file")
 	}
 	// And outside the workspace is still refused, which is the boundary that IS
 	// real.

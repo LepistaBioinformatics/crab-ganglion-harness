@@ -18,8 +18,10 @@ import (
 
 type Store struct {
 	Root string
-	// Projects, when set, is the parent of the per-project subtrees. See dir.
-	Projects string
+	// Workspace, when set, is the MAIN workspace directory -- the one a project's
+	// is a sibling of. Empty means this store serves no projects, which is every
+	// deployment that has none. See dir.
+	Workspace string
 
 	mu sync.Mutex
 }
@@ -106,16 +108,17 @@ func safe(s string) string {
 //
 // The leaf name is taken from Root rather than configured separately, so the
 // two can never disagree: <workspace>/sessions becomes
-// <workspace>/projects/<id>/sessions, and the same store type serves windows
-// without knowing it.
+// <workspace>-<id>/sessions -- a SIBLING of the main workspace, which is how
+// picoclaw lays a project out and therefore how the proxy reads one -- and the
+// same store type serves windows without knowing it.
 //
 // safe() is applied to the project too. The ingress already refuses anything
 // outside [a-z0-9_-], and a store that trusted that would be one refactor away
 // from writing wherever a header said.
 func (s *Store) dir(ctx context.Context) string {
 	p := domain.ProjectFrom(ctx)
-	if p == "" || s.Projects == "" {
+	if p == "" || s.Workspace == "" {
 		return s.Root
 	}
-	return filepath.Join(s.Projects, safe(p), filepath.Base(s.Root))
+	return filepath.Join(domain.ProjectWorkspace(s.Workspace, safe(p)), filepath.Base(s.Root))
 }

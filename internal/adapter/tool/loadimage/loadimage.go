@@ -128,10 +128,7 @@ func (t *Tool) resolve(ctx context.Context, raw string) (string, error) {
 	p := raw
 	if !filepath.IsAbs(p) {
 		// Relative to the PROJECT when there is one, so `load_image("x.png")`
-		// inside a project finds that project's file. The escape check below
-		// still measures against the whole workspace: separating a member's
-		// projects from each other is a convention, and dressing it up as a
-		// boundary here would make this function claim something it cannot do.
+		// inside a project finds that project's file.
 		p = filepath.Join(domain.ProjectRoot(ctx, t.workspace), p)
 	}
 	real, err := filepath.EvalSymlinks(p)
@@ -140,9 +137,20 @@ func (t *Tool) resolve(ctx context.Context, raw string) (string, error) {
 		// it as the missing file it is, using the cleaned form.
 		real = filepath.Clean(p)
 	}
-	root, err := filepath.EvalSymlinks(t.workspace)
+	// The TURN'S workspace, which is the same hierarchy the shell beside this
+	// tool is confined to (exec.command). The three workspace tools must agree,
+	// and now they agree on something the kernel enforces.
+	//
+	// This used to measure against the main workspace and say that separating a
+	// member's projects was "a convention, and dressing it up as a boundary here
+	// would make this function claim something it cannot do". That was true
+	// while a project lived inside the workspace and one Landlock domain covered
+	// both. A project's workspace is a sibling now and the sandbox root narrowed
+	// with it, so the claim is one the kernel backs.
+	bound := domain.ProjectRoot(ctx, t.workspace)
+	root, err := filepath.EvalSymlinks(bound)
 	if err != nil {
-		root = filepath.Clean(t.workspace)
+		root = filepath.Clean(bound)
 	}
 	rel, err := filepath.Rel(root, real)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
