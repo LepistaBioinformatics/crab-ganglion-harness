@@ -37,21 +37,28 @@ func invoke(t *testing.T, tool *Tool, d *domain.Depth, in string) domain.Result 
 	return res
 }
 
-// AC-7. With no model declaring a level there is NO TOOL.
+// The tool exists whatever the registry holds, and this test replaced its exact
+// inverse.
 //
-// The imagegen precedent: a model told it can choose a depth, whose every
-// choice then changes nothing on the wire, has spent a turn learning what boot
-// already knew. And unlike search there is no keyless fallback that could have
-// worked -- the operator has to declare the key.
-func TestWithNoModelDeclaringALevelThereIsNoTool(t *testing.T) {
-	if New(config.Registry{}) != nil {
-		t.Error("an empty registry yielded a tool")
-	}
-	if New(reg("", "")) != nil {
-		t.Error("a registry whose models declare no thinking_level yielded a tool")
-	}
-	if New(reg("", "high")) == nil {
-		t.Error("one model in the chain declaring a level should be enough")
+// The old rule gated the tool on some model declaring a thinking_level, on the
+// imagegen precedent: a choice that changes nothing on the wire is a wasted
+// turn. The premise it rested on -- that no keyless fallback could work -- was
+// wrong twice over. Depth can select a MODEL (Loop.preferDeep), which is how
+// providers express thinking more often than as a field, and failing that it is
+// said in the PROMPT (Loop.deliberate), which works on every model there is.
+//
+// What the gate actually shipped was an agent running deepseek-chat that could
+// not ask for more thought under any circumstances, and a boot line saying so to
+// an operator who could do nothing about it from inside the container.
+func TestTheToolExistsWhateverTheRegistryDeclares(t *testing.T) {
+	for name, r := range map[string]config.Registry{
+		"an empty registry":                  {},
+		"models declaring no thinking_level": reg("", ""),
+		"a model declaring one":              reg("", "high"),
+	} {
+		if New(r) == nil {
+			t.Errorf("%s: no tool", name)
+		}
 	}
 }
 

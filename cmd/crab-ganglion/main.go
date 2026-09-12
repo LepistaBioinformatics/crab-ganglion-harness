@@ -349,14 +349,21 @@ func tools(workspace, self string, reg config.Registry, child domain.SubAgent, l
 	// varies is whether a model can SEE the result, which the vision chain
 	// decides at completion time rather than here.
 	out := []tool.Tool{shellTool(workspace, self), loadimage.New(workspace)}
-	if d := thinking.New(reg); d != nil {
-		out = append(out, d)
-		logger.Printf("tools: set_reasoning_depth enabled")
-	} else {
-		// Named, because the absence is invisible otherwise: a deployment whose
-		// models declare no thinking_level will never think deeply and will
-		// look exactly like one that does.
-		logger.Printf("tools: set_reasoning_depth unavailable -- no model declares thinking_level")
+	out = append(out, thinking.New(reg))
+	// WHICH of the three ways depth travels is a property of the registry, and
+	// an operator cannot see it from inside the container. So the boot says it.
+	//
+	// This used to log "unavailable -- no model declares thinking_level", which
+	// was accurate and useless: it named a gap the reader could do nothing about
+	// and implied the agent could not think harder at all, which is no longer
+	// true of any deployment.
+	switch deep := reg.Deep(); {
+	case len(deep) > 0:
+		logger.Printf("tools: set_reasoning_depth enabled -- depth routes to %s when the turn's model takes no depth field",
+			strings.Join(deep, ", "))
+	default:
+		logger.Printf("tools: set_reasoning_depth enabled -- no model declares thinking_level, " +
+			"so depth is carried in the prompt; register a reasoning model to have it routed instead")
 	}
 	if s := websearch.New(reg.Web, nil, logger.Printf); s != nil {
 		out = append(out, s, websearch.NewFetch(reg.Web.FetchLimitBytes, logger.Printf))

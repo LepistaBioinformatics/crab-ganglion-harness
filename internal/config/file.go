@@ -461,6 +461,24 @@ func (r Registry) Find(name string) (ModelSpec, bool) {
 	return ModelSpec{}, false
 }
 
+// Deep returns the enabled models that declare a thinking_level, in registry
+// order.
+//
+// Registry order rather than the default chain's, because these are not
+// fallbacks: the loop reaches for one when the agent has asked to think harder
+// and the model it would otherwise use cannot express that. The operator's own
+// ordering of model_list is the only statement of preference available, and it
+// is a better one than "whatever happens to be the default".
+func (r Registry) Deep() []string {
+	var out []string
+	for _, m := range r.Models {
+		if m.Enabled && m.ThinkingLevel != "" {
+			out = append(out, m.Name)
+		}
+	}
+	return out
+}
+
 // Chain resolves the ordered candidates for one turn.
 //
 // A turn naming a model IN the registry runs on it (and on its own fallbacks

@@ -99,6 +99,16 @@ func (r *Router) SendsThinking(model string) bool {
 	return ok && m.ThinkingLevel != ""
 }
 
+// DeepModels reports the models that accept a depth field (domain.ThinkingChain).
+//
+// No refresh, for the reason SendsThinking gives: it is asked DURING a turn,
+// against the registry Chain pinned at that turn's start.
+func (r *Router) DeepModels() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.reg.Deep()
+}
+
 // Chain answers the loop's "which models, in what order" and is also the
 // reload point.
 //

@@ -40,6 +40,22 @@ type ModelChain interface {
 // so it is asked rather than guessed.
 type ThinkingChain interface {
 	SendsThinking(model string) bool
+	// DeepModels are the enabled models that DO accept a depth field, best
+	// first, or nothing when the registry has none.
+	//
+	// It exists because "the agent may choose how hard to think" and "this
+	// provider takes a reasoning field" are different facts, and tying the
+	// first to the second left an agent whose only model is deepseek-chat
+	// unable to ask for depth at all. Depth selecting a MODEL is also how the
+	// providers themselves express it -- deepseek-chat against
+	// deepseek-reasoner, gpt-5 against the o-series -- so this is the shape the
+	// world already has rather than one invented here.
+	//
+	// Kindless on purpose: the loop applies it only to a text turn. A turn
+	// carrying an image has already been routed to a model that can SEE, and
+	// trading that for one that can think would answer a question about a
+	// picture nobody looked at.
+	DeepModels() []string
 }
 
 // Learner observes completed turns.

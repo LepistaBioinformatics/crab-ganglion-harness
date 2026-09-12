@@ -373,7 +373,7 @@ func (l *Loop) completeWithFallback(
 	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
 	answersAt time.Time, alreadySaid string,
 ) (domain.Message, domain.Usage, error) {
-	msg, usage, err := l.tryChain(ctx, t, w, sink, answersAt, alreadySaid, l.modelsFor(t, w))
+	msg, usage, err := l.tryChain(ctx, t, w, sink, answersAt, alreadySaid, l.modelsFor(ctx, t, w))
 	if err == nil || !hasAttachments(w) {
 		return msg, usage, err
 	}
@@ -400,7 +400,7 @@ func (l *Loop) completeWithFallback(
 		Content: "An image was attached to this conversation and no configured model could read it. " +
 			"Answer from the text, and say plainly that you could not see the image.",
 	}}, stripped.Messages...)
-	return l.tryChain(ctx, t, stripped, sink, answersAt, alreadySaid, l.modelsFor(t, domain.Window{}))
+	return l.tryChain(ctx, t, stripped, sink, answersAt, alreadySaid, l.modelsFor(ctx, t, domain.Window{}))
 }
 
 // tryChain walks one ordered list of candidates.
@@ -471,14 +471,14 @@ func (l *Loop) systemFor(ctx context.Context) string {
 // see one. Read from the window rather than from the turn's own input because
 // an image sent three messages ago is still in the context being sent, and it
 // is the REQUEST that has to be answerable, not the last thing typed.
-func (l *Loop) modelsFor(t domain.Turn, w domain.Window) []string {
+func (l *Loop) modelsFor(ctx context.Context, t domain.Turn, w domain.Window) []string {
 	kind := domain.ModelText
 	if hasAttachments(w) {
 		kind = domain.ModelVision
 	}
 	if l.Models != nil {
 		if chain := l.Models.Chain(t.Model, kind); len(chain) > 0 {
-			return chain
+			return l.preferDeep(ctx, kind, chain)
 		}
 		// A ModelChain that has no vision slot is not a reason to give up on
 		// the turn: a deployment whose only model is multimodal configures no
@@ -487,11 +487,72 @@ func (l *Loop) modelsFor(t domain.Turn, w domain.Window) []string {
 		// the loop correct whatever implements the port.
 		if kind != domain.ModelText {
 			if chain := l.Models.Chain(t.Model, domain.ModelText); len(chain) > 0 {
-				return chain
+				return l.preferDeep(ctx, domain.ModelText, chain)
 			}
 		}
 	}
 	return []string{l.modelFor(t)}
+}
+
+// preferDeep puts a thinking-capable model at the head of the chain when the
+// agent has asked to think harder and the model it would otherwise use cannot
+// express that.
+//
+// Re-evaluated on EVERY iteration, which is the point: set_reasoning_depth is a
+// tool, so the depth is raised in the middle of a turn, after the agent has seen
+// enough to know the problem is hard. A choice made once at the turn's start
+// would be made before the evidence for it existed.
+//
+// The original chain stays behind the new head rather than being replaced. A
+// deep model that is down must not take the turn with it, and the ordinary
+// fallback ladder is exactly the recovery that belongs here.
+//
+// TEXT ONLY. A turn carrying an image was routed to a model that can SEE, and
+// trading that for one that can think would answer a question about a picture
+// nobody looked at.
+func (l *Loop) preferDeep(ctx context.Context, kind domain.ModelKind, chain []string) []string {
+	if kind != domain.ModelText || l.Thinking == nil || len(chain) == 0 {
+		return chain
+	}
+	depth := domain.DepthFrom(ctx)
+	if depth.Level() == "" || l.Thinking.SendsThinking(chain[0]) {
+		return chain
+	}
+	deep := l.Thinking.DeepModels()
+	if len(deep) == 0 {
+		return chain // nothing deeper exists; the directive carries the depth
+	}
+	out := make([]string, 0, len(deep)+len(chain))
+	seen := map[string]bool{}
+	for _, name := range append(append([]string{}, deep...), chain...) {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// deliberate is the depth the WIRE cannot carry, said in the prompt instead.
+//
+// The floor under the whole feature: it needs no configuration, no second model
+// and no provider support, so an agent can always ask to think harder and have
+// it mean something. It is appended only when the chosen model takes no depth
+// field -- when the field is available the turn already carries the choice, and
+// adding prose as well would change a path that works today for no gain.
+//
+// Deliberately plain and short. A long instruction competes with the agent's own
+// system prompt for attention, and what is being asked for here is one thing.
+func deliberate(reason string) string {
+	out := "\n\nThis turn has been marked as needing deeper reasoning. Work the problem " +
+		"through step by step before answering: state what is being asked, consider the " +
+		"alternatives that are actually different from one another, and check your answer " +
+		"against the evidence you have rather than against what sounds right."
+	if reason != "" {
+		out += " The agent raised the depth because: " + reason
+	}
+	return out
 }
 
 // sendsThinking is nil-safe: no chain wired means no model carries depth, so
@@ -549,10 +610,14 @@ func (l *Loop) complete(
 	// every caller of complete is inside one, so threading it through four
 	// signatures would say nothing the context does not already say.
 	depth := domain.DepthFrom(ctx)
+	system := l.systemFor(ctx)
+	if depth.Level() != "" && !l.sendsThinking(model) {
+		system += deliberate(depth.Reason())
+	}
 	stream, err := l.Provider.Complete(ctx, domain.Completion{
 		Model:    model,
 		Window:   w,
-		System:   l.systemFor(ctx),
+		System:   system,
 		Tools:    l.Tools.Available(ctx),
 		Messages: w.Messages,
 
