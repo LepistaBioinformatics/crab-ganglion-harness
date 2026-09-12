@@ -124,6 +124,14 @@ func main() {
 	// and far cheaper than the second layout it was buying.
 	transcript := jsonl.New(filepath.Join(workspace, "sessions"))
 	transcript.Workspace = workspace
+	windows := windowStore(workspace)
+	// The window is REBUILT from the transcript when it is missing, which is the
+	// state every conversation migrated from picoclaw arrives in: a full
+	// transcript and no window at all. Without this the member would see their
+	// history on screen and the agent would answer as though the conversation had
+	// just begun.
+	windows.Transcript = transcript
+	windows.SeedBudget = runtime.DefaultWindowBudget
 	loop := &runtime.Loop{
 		Provider:   models,
 		Models:     models,
@@ -132,7 +140,7 @@ func main() {
 		// Same store, second port: it appends AND checkpoints, but the loop
 		// only ever sees the narrow interface for each job.
 		Checkpoints: transcript,
-		Context:     windowStore(workspace),
+		Context:     windows,
 		Model:       cfg.Model,
 		System:      systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{

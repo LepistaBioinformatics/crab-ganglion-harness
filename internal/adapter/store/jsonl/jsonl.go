@@ -197,16 +197,39 @@ func (s *Store) Read(ctx context.Context, id domain.ConversationID) ([]domain.Me
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.Open(s.path(ctx, id))
+	out := []domain.Message{}
+	// A conversation MIGRATED from picoclaw is read first and this harness's own
+	// file second, because picoclaw wrote everything that happened before the
+	// move. Ordinary for every other conversation: picoclawTranscripts finds
+	// nothing and this is one ReadDir.
+	dir := s.dir(ctx)
+	for _, base := range picoclawTranscripts(dir, string(id)) {
+		msgs, err := readTranscript(filepath.Join(dir, base+".jsonl"))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msgs...)
+	}
+	msgs, err := readTranscript(s.path(ctx, id))
+	if err != nil {
+		return nil, err
+	}
+	return append(out, msgs...), nil
+}
+
+// readTranscript reads one jsonl file. A missing one is an empty conversation,
+// not an error: it is the ordinary state of a conversation nobody has spoken in.
+func readTranscript(path string) ([]domain.Message, error) {
+	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return []domain.Message{}, nil
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open transcript: %w", err)
 	}
 	defer f.Close()
 
-	out := []domain.Message{}
+	var out []domain.Message
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 	for sc.Scan() {

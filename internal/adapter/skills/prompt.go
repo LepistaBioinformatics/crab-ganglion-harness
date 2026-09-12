@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,17 @@ func (p *Prompt) System(ctx context.Context) string {
 
 	var b strings.Builder
 	b.WriteString(p.persona())
+	// The MAIN workspace's memory, on every turn including a project's. picoclaw
+	// injects it for its default agent and a project agent alike, and it is where
+	// the proxy's managed documents land -- FILE_DELIVERY.md above all, which is
+	// what tells an agent where a deliverable has to be written to be visible to
+	// the member at all.
+	for _, sec := range p.workspaceSections() {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(sec)
+	}
 	for _, sec := range p.projectSections(project) {
 		if b.Len() > 0 {
 			b.WriteString("\n\n")
@@ -117,14 +129,76 @@ const ProjectFileName = "PROJECT.md"
 // MemoryFileName is the project's memory: a plain Markdown file the agent edits
 // with the shell it already has.
 //
-// A FILE AND NOT A TOOL, which is what picoclaw does too -- its memory is
+// A FILE AND NOT A TOOL, which is what picoclaw does too, at THE SAME PATH:
 // <workspace>/memory/MEMORY.md, injected into the prompt and edited with the
-// ordinary file tools. A memory tool would be a second way to write a file this
+// ordinary file tools.
+//
+// It was <workspace>/MEMORY.md here for one release -- the comment named
+// picoclaw's path and the constant did not follow it. That cost nothing while
+// the two harnesses only had to coexist, and everything once a member's
+// directory had to move between them: the proxy's managed-memory documents are
+// mounted into memory/, so a ganglion agent could neither read them nor be found
+// by anything that writes there. A memory tool would be a second way to write a file this
 // agent can already write, and a store the member could not read.
 //
 // This is the first memory the ganglion harness has had at all: until now its
 // only persistence was the transcript and the window.
-const MemoryFileName = "MEMORY.md"
+const MemoryFileName = "memory/MEMORY.md"
+
+// workspaceSections reads the main workspace's memory and the managed documents
+// beside it.
+//
+// EVERY file in memory/, not a fixed list: the proxy mounts FILE_DELIVERY.md,
+// CONTEXT_RECOVERY.md and MEMORY_ROUTING.md today and an admin may add more, and
+// a harness that enumerated the three it knew about would silently ignore the
+// fourth. picoclaw reads the directory for the same reason.
+//
+// MEMORY.md comes first and the rest follow in name order, so the render is
+// stable: an unstable prompt would defeat provider-side caching and make two
+// identical turns look different.
+func (p *Prompt) workspaceSections() []string {
+	if p.Loader.Workspace == "" {
+		return nil
+	}
+	dir := filepath.Join(p.Loader.Workspace, memoryDirName)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil // no memory directory is the ordinary state of a new workspace
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if (names[i] == memoryBaseName) != (names[j] == memoryBaseName) {
+			return names[i] == memoryBaseName
+		}
+		return names[i] < names[j]
+	})
+
+	var out []string
+	for _, name := range names {
+		b, rerr := os.ReadFile(filepath.Join(dir, name))
+		if rerr != nil {
+			p.logf("memory %s unreadable: %v", name, rerr)
+			continue
+		}
+		if body := strings.TrimSpace(string(b)); body != "" {
+			out = append(out, body)
+		}
+	}
+	return out
+}
+
+// memoryDirName and memoryBaseName split MemoryFileName, which is a relative
+// path rather than a name. Named here so the split happens once.
+const (
+	memoryDirName  = "memory"
+	memoryBaseName = "MEMORY.md"
+)
 
 // projectSections reads the project's instructions and memory, in that order.
 //

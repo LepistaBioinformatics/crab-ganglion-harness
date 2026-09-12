@@ -81,6 +81,19 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A turn with NO conversation is refused, and refused rather than ignored.
+	//
+	// jsonl.safe("") is "_", so an empty id fails nowhere downstream -- it writes
+	// a valid-looking transcript under a name nothing ever reads back. A
+	// `_.jsonl` holding real turns was found in a live workspace. The proxy
+	// always sends the header, so an empty id means the caller is not the proxy
+	// or the proxy has a bug, and answering it would put somebody's conversation
+	// in a file only a directory listing would find.
+	if strings.TrimSpace(req.sessionID(r)) == "" {
+		http.Error(w, "a conversation id is required", http.StatusBadRequest)
+		return
+	}
+
 	// REFUSED BEFORE THE STREAM OPENS, and refused rather than ignored.
 	//
 	// The id becomes a directory name, so this is the whole distance between a
