@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
 )
 
 // server is a fake MCP endpoint. It answers by method so a test states only what
@@ -364,5 +366,78 @@ func TestCloseIsANoOpWithoutASession(t *testing.T) {
 	c := New("memory", "http://127.0.0.1:1/v1/mcp", nil, time.Second)
 	if err := c.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// The turn's project travels on every call, so a server that keeps a graph per
+// project can tell them apart.
+//
+// Without this the ganglion wrote every project's memory into the member's
+// GLOBAL graph -- the one server it is given carries the member's token and
+// nothing else, so nothing in the request said which project the work belonged
+// to. A project's memory filling up with another's is invisible until someone
+// reads it.
+func TestACallCarriesTheTurnsProject(t *testing.T) {
+	var seen []string
+	s := &server{listPage: map[string]listToolsResult{
+		"": {Tools: []toolDescriptor{{Name: "memory_add"}}},
+	}}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get(ProjectHeader))
+		s.handler(t).ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	// Boot runs under no project, and must say so rather than guessing one.
+	c, tools, err := Connect(context.Background(), "memory", ts.URL, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = c
+	for i, h := range seen {
+		if h != "" {
+			t.Errorf("boot request %d carried project %q", i, h)
+		}
+	}
+
+	before := len(seen)
+	ctx := domain.WithProject(context.Background(), "seedtrial")
+	if _, err := tools[0].Invoke(ctx, nil); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if len(seen) <= before {
+		t.Fatal("the call never reached the server")
+	}
+	for i := before; i < len(seen); i++ {
+		if seen[i] != "seedtrial" {
+			t.Errorf("call %d carried project %q, want seedtrial", i, seen[i])
+		}
+	}
+}
+
+// A turn in the agent's own workspace sends nothing, so the server resolves the
+// member's global graph exactly as it did before this existed.
+func TestACallOutsideAProjectCarriesNoProject(t *testing.T) {
+	var seen []string
+	s := &server{listPage: map[string]listToolsResult{
+		"": {Tools: []toolDescriptor{{Name: "memory_add"}}},
+	}}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get(ProjectHeader))
+		s.handler(t).ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	_, tools, err := Connect(context.Background(), "memory", ts.URL, nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tools[0].Invoke(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	for i, h := range seen {
+		if h != "" {
+			t.Errorf("request %d carried project %q, want none", i, h)
+		}
 	}
 }
