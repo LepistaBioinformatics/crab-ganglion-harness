@@ -19,7 +19,14 @@ func projectWorkspace(t *testing.T, project string, files map[string]string) str
 		t.Fatal(err)
 	}
 	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		// MemoryFileName is a relative PATH (memory/MEMORY.md), not a name, so
+		// the parent has to exist. That is the whole point of the move: picoclaw
+		// puts a workspace's memory in memory/ and so does this now.
+		full := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,5 +114,71 @@ func TestAProjectWithNoFilesIsSilent(t *testing.T) {
 	}
 	if len(logged) != 0 {
 		t.Errorf("a new project logged %v", logged)
+	}
+}
+
+// The MAIN workspace's memory reaches every turn, a project's included, and at
+// picoclaw's path -- which is what a migrated member's directory already has.
+func TestTheWorkspaceMemoryReachesEveryTurn(t *testing.T) {
+	ws := t.TempDir()
+	dir := filepath.Join(ws, "memory")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MEMORY.md"),
+		[]byte("The member prefers metric units."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, project := range []string{"", "seed-trial"} {
+		got := promptFor(t, ws, project)
+		if !strings.Contains(got, "metric units") {
+			t.Errorf("project %q did not carry the workspace memory:\n%s", project, got)
+		}
+	}
+}
+
+// EVERY document in memory/, not a fixed list. The proxy mounts three today and
+// an admin may add a fourth; a harness that enumerated the ones it knew about
+// would silently ignore it.
+//
+// FILE_DELIVERY.md is the one that matters most: it is what tells an agent where
+// a deliverable has to be written to be visible to the member at all.
+func TestEveryManagedMemoryDocumentIsInjected(t *testing.T) {
+	ws := t.TempDir()
+	dir := filepath.Join(ws, "memory")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	docs := map[string]string{
+		"MEMORY.md":           "what the agent learned",
+		"FILE_DELIVERY.md":    "write deliverables into public/attachments",
+		"CONTEXT_RECOVERY.md": "how to recover context",
+		"SOMETHING_NEW.md":    "a document nobody hardcoded",
+	}
+	for name, body := range docs {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := promptFor(t, ws, "")
+	for _, body := range docs {
+		if !strings.Contains(got, body) {
+			t.Errorf("missing from the prompt: %q\n%s", body, got)
+		}
+	}
+	// MEMORY.md leads, so the render is stable and the agent's own memory is not
+	// buried under the managed documents.
+	if i, j := strings.Index(got, "what the agent learned"), strings.Index(got, "how to recover context"); i > j {
+		t.Error("MEMORY.md did not come first")
+	}
+}
+
+// A workspace with no memory directory is the ordinary state of a new one, and
+// must render exactly as it did before any of this existed.
+func TestAWorkspaceWithNoMemoryDirectoryIsUnchanged(t *testing.T) {
+	got := promptFor(t, t.TempDir(), "")
+	if strings.TrimSpace(got) != "You are a crab." {
+		t.Fatalf("prompt = %q", got)
 	}
 }

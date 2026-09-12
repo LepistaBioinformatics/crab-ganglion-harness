@@ -3,6 +3,14 @@
 // Unlike the transcript, this file is rewritten freely -- that is the whole
 // point of the split. Losing it costs the next turn some context and can be
 // rebuilt from the transcript; it can never cost the member their history.
+//
+// "Can be rebuilt from the transcript" was a claim this package made and did not
+// keep: a missing window was an EMPTY window, so the agent answered a
+// conversation it could not see. That was survivable while the only way to lose
+// a window was to delete one. It stopped being survivable with migration, where
+// every conversation moved from picoclaw arrives with a full transcript and no
+// window at all -- the member would see their history on screen and the agent
+// would answer as though the conversation had just begun. See Load.
 package window
 
 import (
@@ -22,6 +30,17 @@ type Store struct {
 	// is a sibling of. Empty means this store serves no projects, which is every
 	// deployment that has none. See dir.
 	Workspace string
+	// Transcript, when set, is what a missing window is rebuilt from. Nil keeps
+	// the old behaviour (a miss is an empty window), which is what every test
+	// that does not care about rebuilding gets.
+	//
+	// The narrow port, not the concrete store: this package must not import
+	// another adapter (AR-4), and reading messages is all it needs.
+	Transcript domain.TranscriptStore
+	// SeedBudget bounds a rebuilt window, and is the loop's own WindowBudget.
+	// Seeding an unbounded transcript would hand the first completion after a
+	// migration a context the compaction has not seen yet.
+	SeedBudget int
 
 	mu sync.Mutex
 }
@@ -38,18 +57,48 @@ func (s *Store) Load(ctx context.Context, id domain.ConversationID) (domain.Wind
 
 	b, err := os.ReadFile(s.path(ctx, id))
 	if os.IsNotExist(err) {
-		return domain.Window{}, nil
+		return s.rebuild(ctx, id), nil
 	}
 	if err != nil {
 		return domain.Window{}, fmt.Errorf("read window: %w", err)
 	}
 	var w domain.Window
 	if err := json.Unmarshal(b, &w); err != nil {
-		// A corrupt window is recoverable by construction: start empty rather
-		// than failing the turn. The transcript still holds everything.
-		return domain.Window{}, nil
+		// A corrupt window is recoverable by construction: rebuild rather than
+		// failing the turn. The transcript still holds everything.
+		return s.rebuild(ctx, id), nil
 	}
 	return w, nil
+}
+
+// rebuild reconstructs a window from the transcript, or returns an empty one.
+//
+// The two cases it serves look different and are the same: a conversation
+// MIGRATED from picoclaw, which has a transcript and has never had a window, and
+// a window lost to a deleted file or a corrupt write. Both are "the durable
+// record survived and the derived one did not", which is exactly the split this
+// package exists to make survivable.
+//
+// A read failure yields an EMPTY window rather than an error. Failing the turn
+// would take an agent off the air over a derived file, and the empty window is
+// the behaviour this had before rebuilding existed -- degrading to it is the
+// safe direction.
+//
+// Only the tail is taken. The whole transcript would hand the first completion a
+// context the loop's compaction has not run on yet, and a migrated conversation
+// can be thousands of messages long.
+func (s *Store) rebuild(ctx context.Context, id domain.ConversationID) domain.Window {
+	if s.Transcript == nil {
+		return domain.Window{}
+	}
+	msgs, err := s.Transcript.Read(ctx, id)
+	if err != nil || len(msgs) == 0 {
+		return domain.Window{}
+	}
+	if s.SeedBudget > 0 && len(msgs) > s.SeedBudget {
+		msgs = msgs[len(msgs)-s.SeedBudget:]
+	}
+	return domain.Window{Messages: msgs}
 }
 
 // Save writes atomically. A window truncated by a crash mid-write would be read

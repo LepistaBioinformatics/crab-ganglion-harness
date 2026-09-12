@@ -23,7 +23,11 @@ func serve(t *testing.T, s *Server, h domain.TurnHandler, body string, hdr map[s
 	return rec
 }
 
-const oneUser = `{"model":"m","stream":true,"messages":[{"role":"user","content":"oi"}]}`
+// A conversation id is REQUIRED now, so every body that does not set the header
+// carries one. The tests that predate the requirement relied on the empty
+// fallback, which is exactly what wrote `_.jsonl` in a live workspace.
+const oneUser = `{"model":"m","stream":true,"session_id":"conv-1",` +
+	`"messages":[{"role":"user","content":"oi"}]}`
 
 func TestCompletions_StreamsDeltasAsOpenAIChunks(t *testing.T) {
 	s := New(":0", "")
@@ -123,5 +127,40 @@ func TestCompletions_FailedTurnStillTerminatesTheStream(t *testing.T) {
 	}
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("stream left open after a failure:\n%s", body)
+	}
+}
+
+// A turn with NO conversation id is refused before the stream opens.
+//
+// jsonl.safe("") is "_", so an empty id fails nowhere downstream -- it writes a
+// valid-looking transcript under a name nothing ever reads back. A `_.jsonl`
+// holding real turns was found in a live workspace.
+func TestATurnWithNoConversationIdIsRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		hdr  map[string]string
+	}{
+		"neither header nor body": {
+			body: `{"model":"m","stream":true,"messages":[{"role":"user","content":"oi"}]}`,
+		},
+		"an empty header and no body field": {
+			body: `{"model":"m","stream":true,"messages":[{"role":"user","content":"oi"}]}`,
+			hdr:  map[string]string{"X-Ganglion-Session-Id": "   "},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var ran bool
+			rec := serve(t, New("", ""), func(context.Context, domain.Turn, domain.Sink) (string, error) {
+				ran = true
+				return "", nil
+			}, tc.body, tc.hdr)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rec.Code)
+			}
+			if ran {
+				t.Error("the turn ran, so it would have written a transcript nothing reads back")
+			}
+		})
 	}
 }
