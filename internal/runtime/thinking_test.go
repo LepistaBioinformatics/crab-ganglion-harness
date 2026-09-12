@@ -29,9 +29,13 @@ func (d *depthTools) Invoke(ctx context.Context, _ domain.ToolCall) (domain.Resu
 }
 
 // thinkingChain answers "would this model carry a depth field".
-type thinkingChain struct{ sends map[string]bool }
+type thinkingChain struct {
+	sends map[string]bool
+	deep  []string
+}
 
 func (t thinkingChain) SendsThinking(m string) bool { return t.sends[m] }
+func (t thinkingChain) DeepModels() []string        { return t.deep }
 
 // toolThenAnswer is the two-iteration shape every test here needs: the model
 // calls one tool, then answers.

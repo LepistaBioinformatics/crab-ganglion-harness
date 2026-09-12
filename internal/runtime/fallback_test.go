@@ -29,6 +29,15 @@ type scripted struct {
 	content    map[string]string
 	// observe sees every completion before it is answered.
 	observe func(domain.Completion)
+	// toolsOnce makes a model's FIRST completion return these tool calls and
+	// every later one answer normally.
+	//
+	// One call, not a script per call, because what the depth tests need is a
+	// turn whose depth is raised BETWEEN two completions -- which is the real
+	// shape: set_reasoning_depth is a tool, so the agent asks for depth only
+	// after it has seen enough to know the problem is hard.
+	toolsOnce map[string][]domain.ToolCall
+	served    map[string]int
 }
 
 func (s *scripted) Complete(_ context.Context, c domain.Completion) (domain.Stream, error) {
@@ -38,6 +47,14 @@ func (s *scripted) Complete(_ context.Context, c domain.Completion) (domain.Stre
 	}
 	if err := s.fail[c.Model]; err != nil {
 		return nil, err
+	}
+	if s.served == nil {
+		s.served = map[string]int{}
+	}
+	n := s.served[c.Model]
+	s.served[c.Model] = n + 1
+	if calls := s.toolsOnce[c.Model]; n == 0 && len(calls) > 0 {
+		return &scriptedStream{calls: calls}, nil
 	}
 	return &scriptedStream{
 		deltas:  s.deltas[c.Model],
@@ -51,6 +68,7 @@ type scriptedStream struct {
 	i       int
 	err     error
 	content string
+	calls   []domain.ToolCall
 }
 
 func (s *scriptedStream) Next(context.Context) (domain.Delta, error) {
@@ -65,7 +83,7 @@ func (s *scriptedStream) Next(context.Context) (domain.Delta, error) {
 	return domain.Delta{}, io.EOF
 }
 func (s *scriptedStream) Message() domain.Message {
-	return domain.Message{Role: domain.RoleAssistant, Content: s.content}
+	return domain.Message{Role: domain.RoleAssistant, Content: s.content, ToolCalls: s.calls}
 }
 func (s *scriptedStream) Usage() domain.Usage { return domain.Usage{} }
 func (s *scriptedStream) Close() error        { return nil }

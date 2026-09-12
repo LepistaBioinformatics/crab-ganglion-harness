@@ -30,20 +30,34 @@ import (
 // Tool implements set_reasoning_depth.
 type Tool struct{}
 
-// New builds the tool, or returns nil when no model in the text chain declared
-// a thinking_level.
+// New builds the tool. It is always available.
 //
-// Nil means ABSENT from the tool list, the same rule generate_image follows. A
-// model told it can choose a depth, whose every choice then changes nothing on
-// the wire, has spent a turn learning what boot already knew -- and unlike
-// search there is no keyless fallback that could have worked.
+// THIS USED TO RETURN NIL when no model declared a thinking_level, and the
+// reason it gave was: "a model told it can choose a depth, whose every choice
+// then changes nothing on the wire, has spent a turn learning what boot already
+// knew -- and unlike search there is no keyless fallback that could have
+// worked."
+//
+// The last clause was the mistake. There are two fallbacks, and neither needs a
+// key:
+//
+//   - The depth can select a MODEL. Providers express thinking as a separate
+//     model far more often than as a field -- deepseek-chat against
+//     deepseek-reasoner, gpt-5 against the o-series -- so a registry holding one
+//     of each already has everything needed (Loop.preferDeep).
+//   - Failing that, the depth is said in the PROMPT (Loop.deliberate). That
+//     works on every model that exists, configured or not.
+//
+// What the old gate actually produced was an agent running deepseek-chat with no
+// way to ask for more thought under any circumstances, and a boot line saying so
+// to an operator who could do nothing about it from inside the container. The
+// capability is the agent's; how far it travels is the deployment's.
+//
+// Which of the three happens is decided per completion, not here, because the
+// depth is raised mid-turn and the answer depends on the model the turn is on
+// at that moment.
 func New(reg config.Registry) *Tool {
-	for _, name := range reg.Chain("", config.KindText) {
-		if m, ok := reg.Find(name); ok && m.ThinkingLevel != "" {
-			return &Tool{}
-		}
-	}
-	return nil
+	return &Tool{}
 }
 
 func (t *Tool) Name() string { return "set_reasoning_depth" }
