@@ -140,3 +140,41 @@ func TestWithNoTranscriptAMissIsStillEmpty(t *testing.T) {
 		t.Fatalf("w=%+v err=%v", w, err)
 	}
 }
+
+// THE TOOL PLUMBING IS NOT REBUILT, and this is the failure that makes it worth
+// a test rather than a comment.
+//
+// The served transcript now records an iteration that called a tool as its own
+// message, carrying the tool_calls crab-shell-proxy reads to render it as a
+// step. The RESULTS answering them were never written there -- the member never
+// saw one. Copied into a window as they are, they are a call with no reply, and
+// the provider rejects the whole request ("insufficient tool messages following
+// tool_calls message") on that turn and on every later turn of the conversation,
+// because the broken window is what gets saved.
+//
+// A picoclaw transcript brings the other half: it logs `tool` entries inline,
+// and the seed takes a tail, so the cut lands wherever it lands.
+func TestARebuiltWindowCarriesNoToolCallsAndNoToolResults(t *testing.T) {
+	tr := &fakeTranscript{msgs: []domain.Message{
+		{Role: domain.RoleUser, Content: "e ai"},
+		{Role: domain.RoleAssistant, Content: "vou olhar", ToolCalls: []domain.ToolCall{{ID: "1", Name: "sh"}}},
+		{Role: domain.RoleTool, Content: "saida", ToolCallID: "1"},
+		{Role: domain.RoleAssistant, Content: "pronto"},
+	}}
+	w, err := store(t, tr, 40).Load(context.Background(), "conv")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(w.Messages) != 3 {
+		t.Fatalf("rebuilt window has %d messages, want the three that were SAID: %+v", len(w.Messages), w.Messages)
+	}
+	for _, m := range w.Messages {
+		if len(m.ToolCalls) > 0 || m.ToolCallID != "" || m.Role == domain.RoleTool {
+			t.Errorf("tool plumbing survived the rebuild: %+v", m)
+		}
+	}
+	// The narration text is what was worth keeping.
+	if w.Messages[1].Content != "vou olhar" {
+		t.Errorf("the narration was lost with its call: %+v", w.Messages[1])
+	}
+}

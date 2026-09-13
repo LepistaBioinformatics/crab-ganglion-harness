@@ -98,7 +98,36 @@ func (s *Store) rebuild(ctx context.Context, id domain.ConversationID) domain.Wi
 	if s.SeedBudget > 0 && len(msgs) > s.SeedBudget {
 		msgs = msgs[len(msgs)-s.SeedBudget:]
 	}
-	return domain.Window{Messages: msgs}
+	return domain.Window{Messages: conversational(msgs)}
+}
+
+// conversational keeps the part of a transcript a provider will accept, which
+// is what was SAID: the tool plumbing is dropped.
+//
+// The transcript is the served history, and its tool_calls are a DISPLAY
+// MARKER -- crab-shell-proxy reads them to render an iteration as a step. The
+// results answering them were never written there, because the member never saw
+// one. Carried into a window as they are, they are a call with no reply, and a
+// provider rejects the whole request for it ("insufficient tool messages
+// following tool_calls message") on every later turn of that conversation --
+// the same permanent failure dropOrphanTools exists for, arriving from the
+// other direction.
+//
+// A picoclaw transcript brings the mirror image: it logs `tool` entries inline,
+// and the seed takes a TAIL, so the cut lands wherever it lands. Dropping both
+// halves is one rule instead of a pair-matching pass, and it loses nothing the
+// transcript keeps: this is a seed for the next turn's context, not the record.
+func conversational(msgs []domain.Message) []domain.Message {
+	out := make([]domain.Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role == domain.RoleTool {
+			continue
+		}
+		m.ToolCalls = nil
+		m.ToolCallID = ""
+		out = append(out, m)
+	}
+	return out
 }
 
 // Save writes atomically. A window truncated by a crash mid-write would be read

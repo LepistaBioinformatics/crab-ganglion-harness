@@ -33,14 +33,23 @@ func turn() domain.Turn {
 	}
 }
 
-// FR-2: content reaches the sink progressively, not as one blob at the end.
+// FR-2 AT FRAME GRANULARITY, which is a weaker promise than this test used to
+// make and the reason the promise changed is worth the paragraph.
 //
-// Deltas are COALESCED on a 50ms wall clock (see coalesce.go), so the
-// assertion is "arrives in pieces as time passes", not "one emission per
-// provider token" -- the provider's token boundaries are not a unit anyone
-// perceives, and forwarding them one for one made the webapp re-render per
-// syllable.
-func TestRun_StreamsContentProgressively(t *testing.T) {
+// It asserted that content arrived in at least two pieces: deltas reached the
+// sink as the model produced them, coalesced on a 50ms wall clock. That is no
+// longer possible. An iteration's text is NARRATION when the frame ends in tool
+// calls and the ANSWER when it does not, nothing says which until the frame
+// ends, and emitting it before knowing is exactly what tore the reply in two
+// when the client reconciled (see Run). So a frame is held and classified once,
+// at EOF -- and one frame is now one emission.
+//
+// What survives, and is what this asserts: the answer reaches the member as
+// CONTENT, whole and unreordered. A ganglion turn still streams in the sense
+// the member cares about -- narration appears as it happens, on the progress
+// channel -- which is what TestRun_NarrationIsProgressAndTheAnswerIsContent
+// covers.
+func TestRun_TheAnswerReachesTheMemberAsContent(t *testing.T) {
 	p := &fakeProvider{turns: []fakeTurn{{
 		deltas: []string{"Oi", ", ", "tudo bem?"},
 		msg:    domain.Message{Role: domain.RoleAssistant, Content: "Oi, tudo bem?"},
@@ -48,8 +57,6 @@ func TestRun_StreamsContentProgressively(t *testing.T) {
 	}}}
 	c := &collect{}
 	l := newLoop(p, &fakeTranscript{}, &fakeContext{}, &fakeTools{}, nil)
-	// A clock that advances past the coalescing interval on every read, so
-	// each delta lands in its own batch.
 	tick := time.Unix(0, 0)
 	l.Now = func() time.Time { tick = tick.Add(100 * time.Millisecond); return tick }
 
@@ -60,17 +67,16 @@ func TestRun_StreamsContentProgressively(t *testing.T) {
 	if got != "Oi, tudo bem?" {
 		t.Errorf("answer = %q", got)
 	}
-	if len(c.content) < 2 {
-		t.Errorf("content arrived in %d piece(s) (%q) -- the loop buffered the whole answer", len(c.content), c.content)
+	if len(c.content) == 0 {
+		t.Error("the answer never reached the member as content")
 	}
 	if c.joined() != "Oi, tudo bem?" {
-		t.Errorf("pieces joined = %q; coalescing must not lose or reorder text", c.joined())
+		t.Errorf("pieces joined = %q; buffering must not lose or reorder text", c.joined())
 	}
 }
 
-// The other half: when every delta lands inside one interval, the final flush
-// must still deliver all of it. Nothing may be dropped because the turn was
-// fast.
+// The other half: a turn whose deltas all land inside one interval must still
+// deliver all of it. Nothing may be dropped because the turn was fast.
 func TestRun_AFastStreamStillDeliversEverything(t *testing.T) {
 	p := &fakeProvider{turns: []fakeTurn{{
 		deltas: []string{"Be", "le", "za", "!"},
@@ -107,10 +113,13 @@ func TestRun_AppendsUserMessageBeforeCallingProvider(t *testing.T) {
 // FR-9, the invariant that came from measured evidence: compaction rewrites
 // the window and must never shorten the transcript.
 //
-// The transcript now holds ONE assistant message per turn -- what the member
-// saw -- so the count is 2, not 4. Tool calls and results live in the window,
-// which is what the provider reads. The property under test is unchanged:
-// compacting must not remove anything from the served history.
+// THE EXPECTED SHAPE CHANGED, twice, and the property never did. It was 4 (one
+// message per model frame and per tool result), then 2 (one assistant message
+// for the whole turn, to stop the reply rewriting itself when the client
+// reconciled), and it is now 3: the user, the narration step, and the answer.
+// Tool RESULTS are still window-only -- the member never saw one. What is
+// asserted here is what was always asserted: compacting a window to a budget of
+// one must not remove anything from the served history.
 func TestRun_CompactionNeverShortensTheTranscript(t *testing.T) {
 	tr := &fakeTranscript{}
 	cs := &fakeContext{}
@@ -128,11 +137,11 @@ func TestRun_CompactionNeverShortensTheTranscript(t *testing.T) {
 	if got != "vou ver. pronto" {
 		t.Errorf("answer = %q, want every iteration's text", got)
 	}
-	if len(tr.log) != 2 {
-		t.Errorf("transcript has %d entries, want user + one assistant: %+v", len(tr.log), tr.log)
+	if len(tr.log) != 3 {
+		t.Errorf("transcript has %d entries, want user + step + answer: %+v", len(tr.log), tr.log)
 	}
-	if tr.log[1].Content != "vou ver. pronto" {
-		t.Errorf("served message = %q; it must be what was streamed", tr.log[1].Content)
+	if said := tr.log[1].Content + tr.log[2].Content; said != "vou ver. pronto" {
+		t.Errorf("the served messages say %q; together they must be what was streamed", said)
 	}
 	last := cs.saved[len(cs.saved)-1]
 	if len(last.Messages) > 1 {
@@ -352,13 +361,18 @@ func TestRun_FallsBackToTheTurnLabelWhenUnconfigured(t *testing.T) {
 // D-2/D-3, from the loop's side. The store's own tests cover the supersession
 // rule; these cover that the loop drives it at all, and cleans up after itself.
 type fakeCheckpoints struct {
-	writes  []string
+	writes []string
+	// dates are the answersAt of each write. Recorded because the sidecar now
+	// stands in for ONE FRAME, and the instant it is dated by is the whole of
+	// what keeps it from being superseded by the step before it.
+	dates   []time.Time
 	cleared int
 	err     error
 }
 
-func (f *fakeCheckpoints) Checkpoint(_ context.Context, _ domain.ConversationID, _ time.Time, content string) error {
+func (f *fakeCheckpoints) Checkpoint(_ context.Context, _ domain.ConversationID, at time.Time, content string) error {
 	f.writes = append(f.writes, content)
+	f.dates = append(f.dates, at)
 	return f.err
 }
 
