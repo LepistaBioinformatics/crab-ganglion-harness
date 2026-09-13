@@ -86,3 +86,92 @@ func TestCompact_UnderBudgetKeepsEverything(t *testing.T) {
 		t.Errorf("compacted a window that fits: %+v", got)
 	}
 }
+
+// The fault this repository met in production: a conversation that could not be
+// answered again, ever, because of the order two messages were written in.
+//
+// The provider's own words were "insufficient tool messages following tool_calls
+// message" -- all the results were present, one of them was just on the far side
+// of the image the first tool returned.
+func TestAMediaFollowUpDoesNotSplitAToolRun(t *testing.T) {
+	w := domain.Window{Messages: []domain.Message{
+		{Role: domain.RoleUser, Content: "look at both"},
+		{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "a"}, {ID: "b"}}},
+		{Role: domain.RoleTool, ToolCallID: "a"},
+		{Role: domain.RoleUser, Content: "Here is the media that tool loaded.",
+			Attachments: []domain.Attachment{{Kind: domain.AttachmentImage, MIME: "image/png"}}},
+		{Role: domain.RoleTool, ToolCallID: "b"},
+		{Role: domain.RoleAssistant, Content: "done"},
+	}}
+
+	got := repair(w)
+
+	roles := make([]domain.Role, 0, len(got.Messages))
+	for _, m := range got.Messages {
+		roles = append(roles, m.Role)
+	}
+	want := []domain.Role{
+		domain.RoleUser, domain.RoleAssistant,
+		domain.RoleTool, domain.RoleTool,
+		domain.RoleUser, domain.RoleAssistant,
+	}
+	if len(roles) != len(want) {
+		t.Fatalf("message count changed: got %v, want %v", roles, want)
+	}
+	for i := range want {
+		if roles[i] != want[i] {
+			t.Fatalf("at %d: got %v, want %v", i, roles, want)
+		}
+	}
+	// MOVED, not dropped. The image is what the member or the tool produced and
+	// the model is meant to see it; healing the conversation by losing it would
+	// trade a dead turn for a quietly wrong answer.
+	if len(got.Messages[4].Attachments) != 1 {
+		t.Fatalf("the media message lost its attachment: %+v", got.Messages[4])
+	}
+}
+
+// A batch that died halfway leaves fewer results than calls. The regrouping must
+// not treat everything after it as part of the run and reorder the rest of the
+// conversation into it.
+func TestAnIncompleteToolRunDoesNotSwallowWhatFollows(t *testing.T) {
+	w := domain.Window{Messages: []domain.Message{
+		{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "a"}, {ID: "b"}}},
+		{Role: domain.RoleTool, ToolCallID: "a"},
+		{Role: domain.RoleAssistant, Content: "gave up"},
+		{Role: domain.RoleUser, Content: "and then?"},
+	}}
+
+	got := repair(w)
+
+	if len(got.Messages) != 4 {
+		t.Fatalf("message count changed: %d", len(got.Messages))
+	}
+	if got.Messages[2].Content != "gave up" || got.Messages[3].Content != "and then?" {
+		t.Fatalf("the tail was reordered: %+v", got.Messages)
+	}
+}
+
+// A window with nothing wrong with it must come back byte for byte. Repair runs
+// on every load, so a rewrite that "fixes" a healthy window is a rewrite of every
+// conversation in the deployment.
+func TestRepairLeavesAWellFormedWindowAlone(t *testing.T) {
+	w := domain.Window{Messages: []domain.Message{
+		{Role: domain.RoleUser, Content: "hi"},
+		{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "a"}}},
+		{Role: domain.RoleTool, ToolCallID: "a"},
+		{Role: domain.RoleAssistant, Content: "there"},
+	}}
+	before := append([]domain.Message(nil), w.Messages...)
+
+	got := repair(w)
+
+	if len(got.Messages) != len(before) {
+		t.Fatalf("count changed: %d -> %d", len(before), len(got.Messages))
+	}
+	for i := range before {
+		if got.Messages[i].Role != before[i].Role || got.Messages[i].Content != before[i].Content {
+			t.Fatalf("at %d: %+v became %+v", i, before[i], got.Messages[i])
+		}
+	}
+}
