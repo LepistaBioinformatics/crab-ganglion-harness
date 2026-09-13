@@ -432,3 +432,67 @@ func TestRun_WorksWithNoCheckpointer(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 }
+
+// The other half of the fix repair() heals: not writing the fault in the first
+// place.
+//
+// A tool that returns an image contributes a synthetic user message carrying it.
+// Appended as each call finished, the first call's image landed BETWEEN the two
+// results and split the run -- and the provider rejects the whole request for it
+// ("insufficient tool messages following tool_calls message"), permanently,
+// because the split window is what gets saved.
+func TestRun_MediaFromOneToolDoesNotSplitTheBatchsResults(t *testing.T) {
+	tr := &fakeTranscript{}
+	cs := &fakeContext{}
+	tl := &fakeTools{result: domain.Result{
+		Content:     "saida",
+		Attachments: []domain.Attachment{{Kind: domain.AttachmentImage, MIME: "image/png"}},
+	}}
+	p := &fakeProvider{turns: []fakeTurn{
+		{msg: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{
+			{ID: "1", Name: "sh", Args: args(`{}`)},
+			{ID: "2", Name: "sh", Args: args(`{}`)},
+		}}},
+		{msg: domain.Message{Role: domain.RoleAssistant, Content: "pronto"}},
+	}}
+	l := newLoop(p, tr, cs, tl, nil)
+
+	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The window as the SECOND provider call saw it -- the one that would have
+	// been rejected. Asserting the saved window would pass even if the request
+	// had been built wrong, because compaction runs between the two.
+	if p.calls < 2 {
+		t.Fatalf("the turn did not reach a second completion: %d", p.calls)
+	}
+	msgs := cs.w.Messages
+	at := -1
+	for i, m := range msgs {
+		if len(m.ToolCalls) == 2 {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		t.Fatalf("the two-call assistant message is not in the window: %+v", msgs)
+	}
+	if at+2 >= len(msgs) ||
+		msgs[at+1].Role != domain.RoleTool || msgs[at+2].Role != domain.RoleTool {
+		t.Fatalf("the two results are not contiguous after the call: %+v", msgs[at:])
+	}
+	media := 0
+	for _, m := range msgs {
+		if len(m.Attachments) > 0 {
+			media++
+			if m.Role != domain.RoleUser {
+				t.Fatalf("media rode on a %s message: %+v", m.Role, m)
+			}
+		}
+	}
+	// Both calls returned one, and neither was dropped to keep the run together.
+	if media != 2 {
+		t.Fatalf("expected both tools' media to survive, got %d", media)
+	}
+}

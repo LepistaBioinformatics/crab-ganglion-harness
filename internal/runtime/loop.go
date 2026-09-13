@@ -179,7 +179,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// result -- by a build that predates dropOrphanTools -- would otherwise
 	// fail at the provider on every turn forever, because nothing else ever
 	// revisits the front of the window.
-	window = dropOrphanTools(window)
+	window = repair(window)
 	window.Messages = append(window.Messages, in)
 
 	// What the member sees, accumulated across every iteration of this turn.
@@ -251,6 +251,20 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			return answer.String(), runErr
 		}
 
+		// Media follow-ups are held until every call in this batch has answered.
+		//
+		// THEY USED TO BE APPENDED INSIDE THE LOOP, and with a single tool call that
+		// is the same thing. With two, the first call's image landed BETWEEN the two
+		// tool results and split the run: providers require the results answering one
+		// assistant message to be contiguous, and the one this stack runs says so in
+		// as many words -- "insufficient tool messages following tool_calls message".
+		//
+		// It is permanent when it happens, which is what makes it worth a variable.
+		// The split message is saved with the window, so every later turn in that
+		// conversation replays it and fails identically. See repairToolRuns, which
+		// heals the conversations this already cost.
+		var media []domain.Message
+
 		for _, call := range msg.ToolCalls {
 			chosen := depth.Level()
 			res, err := c.runTool(ctx, t, call, sink)
@@ -294,7 +308,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			// OpenAI-compatible endpoint understands, and it is what picoclaw
 			// does too (agent_media.go, toolImageFollowUpPromptMessage).
 			if len(res.Attachments) > 0 {
-				window.Messages = append(window.Messages, domain.Message{
+				media = append(media, domain.Message{
 					Role:        domain.RoleUser,
 					Content:     "Here is the media that tool loaded.",
 					Attachments: res.Attachments,
@@ -302,6 +316,9 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				})
 			}
 		}
+
+		// After the whole batch, so the tool results stay contiguous.
+		window.Messages = append(window.Messages, media...)
 
 		window = compact(window, c.WindowBudget)
 		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
