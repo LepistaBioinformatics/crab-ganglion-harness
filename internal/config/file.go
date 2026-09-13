@@ -145,8 +145,20 @@ type file struct {
 				MaxChildIterations    *int `json:"max_child_iterations"`
 				MaxChildrenPerTurn    *int `json:"max_children_per_turn"`
 			} `json:"subturn"`
-			ModelName      string   `json:"model_name"`
-			ModelFallbacks []string `json:"model_fallbacks"`
+			// MaxToolIterations is picoclaw's own key, spelled the same
+			// (agents.defaults.max_tool_iterations), and it bounds the same
+			// thing: how many times one turn may come back for another tool
+			// before it is stopped. Sharing the name is the point -- an admin
+			// editing the config screen should not have to know which harness
+			// is behind the agent to know which key means "how long may this
+			// think".
+			//
+			// A pointer, like the subturn counts above: 0 is a legitimate thing
+			// to write and an absent key is not the same as a zero one. Absent
+			// means "whatever the binary defaults to".
+			MaxToolIterations *int     `json:"max_tool_iterations"`
+			ModelName         string   `json:"model_name"`
+			ModelFallbacks    []string `json:"model_fallbacks"`
 			// image_model and image_model_fallbacks are picoclaw's own keys
 			// (pkg/config/config.go:430-431) for the model that READS images.
 			ImageModel          string   `json:"image_model"`
@@ -284,6 +296,12 @@ type Registry struct {
 	Evolution Evolution
 	// Subturn is the sub-agent fan-out block, with defaults applied.
 	Subturn Subturn
+	// MaxToolIterations is agents.defaults.max_tool_iterations, or 0 when the
+	// file does not set it. NOT defaulted here: this package cannot name the
+	// loop's default without importing it, and the wiring already has to choose
+	// between this, the environment and that default. One place to read the
+	// precedence beats a default applied twice.
+	MaxToolIterations int
 	// MCP is the enabled tools.mcp servers, in configuration order. Empty when
 	// the block is absent or disabled, which is every deployment that has no
 	// memory graph.
@@ -611,6 +629,9 @@ func LoadRegistry(path string, res secret.Resolver, keyEnv func(string) string) 
 
 	reg.Evolution = loadEvolution(f.Evolution)
 	reg.Subturn = loadSubturn(f)
+	if n := f.Agents.Defaults.MaxToolIterations; n != nil && *n > 0 {
+		reg.MaxToolIterations = *n
+	}
 	reg.Vision = f.Agents.Defaults.ImageModel
 	reg.VisionFalls = f.Agents.Defaults.ImageModelFallbacks
 	reg.ImageGen = f.Agents.Defaults.ImageGenModel
