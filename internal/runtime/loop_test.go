@@ -137,10 +137,17 @@ func TestRun_CompactionNeverShortensTheTranscript(t *testing.T) {
 	if got != "vou ver. pronto" {
 		t.Errorf("answer = %q, want every iteration's text", got)
 	}
-	if len(tr.log) != 3 {
-		t.Errorf("transcript has %d entries, want user + step + answer: %+v", len(tr.log), tr.log)
+	// The events entry between them carries no content, so concatenating all
+	// three still reproduces exactly what was streamed -- which is the property
+	// this test is about, and the reason an events entry must never say anything.
+	if len(tr.log) != 4 {
+		t.Errorf("transcript has %d entries, want user + step + events + answer: %+v", len(tr.log), tr.log)
 	}
-	if said := tr.log[1].Content + tr.log[2].Content; said != "vou ver. pronto" {
+	said := ""
+	for _, m := range tr.log[1:] {
+		said += m.Content
+	}
+	if said != "vou ver. pronto" {
 		t.Errorf("the served messages say %q; together they must be what was streamed", said)
 	}
 	last := cs.saved[len(cs.saved)-1]

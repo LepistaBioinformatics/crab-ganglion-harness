@@ -150,6 +150,11 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 
 	depth := &domain.Depth{}
 	ctx = domain.WithDepth(ctx, depth)
+	// What this turn DID, for the member rather than for the model. On the
+	// context because the two places that record without owning it -- the
+	// fallback ladder and the depth change -- are frames below this one.
+	events := &domain.Recorder{}
+	ctx = domain.WithRecorder(ctx, events)
 	// The turn's child budget, created ONCE and shared by everything beneath
 	// it. A child runs this same function, so creating one unconditionally
 	// would hand every child a full budget and make the whole-turn bound a
@@ -295,6 +300,13 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			// frame of its own because the client shows the latest progress
 			// event and nothing else, so a separate narration frame would be
 			// wiped by the tool frame that follows it a millisecond later.
+			// Recorded BEFORE the call, so a turn that dies inside a tool still
+			// says which one it was in. Its status is filled in below; an event
+			// with none is a call whose outcome nobody ever learned, which is
+			// the truth about an interrupted turn.
+			events.Add(domain.TurnEvent{
+				Kind: domain.EventTool, Name: call.Name, Arguments: eventArgs(call.Args),
+			})
 			res, err := c.runTool(ctx, t, call, msg.Content, sink)
 			// Said out loud when it changes. A turn that suddenly takes four
 			// times as long, and costs four times as much, is owed a sentence
@@ -307,17 +319,35 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 					text += ": " + why
 				}
 				sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: text})
+				events.Add(domain.TurnEvent{
+					Kind: domain.EventDepth, Name: lvl, Detail: depth.Reason(),
+				})
 			}
 			if err != nil {
 				runErr = err
 				sink.EmitError(err.Error())
-				// No transcript write here any more: the narration that led to
-				// this call was appended before the call ran.
+				events.Finish(domain.EventFailed, err.Error())
+				// The narration that led to this call was appended before the
+				// call ran, so there is no message to write here -- but the
+				// events are the one thing this path would otherwise lose, and
+				// a failed call is exactly what a member wants to see.
+				c.flushEvents(ctx, t, events, sink)
 				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
 				observe(true)
 				return answer.String(), runErr
 			}
 			outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Denied: res.Denied})
+			if res.Denied {
+				events.Finish(domain.EventDenied, "")
+			} else {
+				events.Finish(domain.EventOK, "")
+			}
+			// Whatever the tool did that this loop cannot see. Appended AFTER
+			// the call's own event, so a dispatcher's children read as belonging
+			// to the call that started them.
+			for _, e := range res.Events {
+				events.Add(e)
+			}
 			out := domain.Message{
 				Role:       domain.RoleTool,
 				Content:    res.Content,
@@ -348,6 +378,17 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 
 		// After the whole batch, so the tool results stay contiguous.
 		window.Messages = append(window.Messages, media...)
+
+		// ONE ENTRY PER ITERATION, written here because an event can only say how
+		// a call ENDED once it has. The narration was written before the tools
+		// ran and stays there -- a turn that dies mid-tool keeps the sentence
+		// explaining why the call was made, and simply has no events, which is
+		// the same detail the transcript carried before this existed.
+		//
+		// It carries no content: it is the iteration's detail, not a second thing
+		// the agent said. The proxy keeps an entry like that precisely because it
+		// has events; without them it would be dropped as empty.
+		c.flushEvents(ctx, t, events, sink)
 
 		window = compact(window, c.WindowBudget)
 		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
@@ -498,6 +539,13 @@ func (l *Loop) tryChain(
 		sink.EmitProgress(domain.Progress{
 			Kind: domain.ProgressPlaceholder,
 			Text: fmt.Sprintf("%s did not answer (%v); trying %s", model, err, chain[i+1]),
+		})
+		// The same fact, kept. A turn that took eight seconds longer because its
+		// first model was down is owed that sentence after the fact too -- the
+		// progress frame above is gone the moment the next one replaces it.
+		domain.RecorderFrom(ctx).Add(domain.TurnEvent{
+			Kind: domain.EventModel, Name: model, Status: domain.EventFailed,
+			Detail: fmt.Sprintf("%v; trying %s", err, chain[i+1]),
 		})
 	}
 	if lastErr == nil {
@@ -898,3 +946,61 @@ func (l *Loop) recordUsage(ctx context.Context, u domain.Usage, t domain.Turn) {
 		domain.Attr{Key: "model", Value: l.modelFor(t)},
 	)
 }
+
+// flushEvents writes one iteration's events as their own transcript entry.
+//
+// It carries no content, which is the whole shape: this is the iteration's
+// DETAIL, not a second thing the agent said. crab-shell-proxy keeps an entry
+// like that precisely because it has events -- without them it is dropped as
+// empty, which is what used to happen to a frame that called a tool and
+// narrated nothing.
+//
+// A failed write is said out loud and swallowed. These are commentary; losing
+// the turn over them would trade the answer for the log of how it was produced.
+func (l *Loop) flushEvents(
+	ctx context.Context, t domain.Turn, events *domain.Recorder, sink domain.Sink,
+) {
+	recorded := events.Take()
+	if len(recorded) == 0 {
+		return
+	}
+	if err := l.Transcript.Append(ctx, t.SessionID, domain.Message{
+		Role: domain.RoleAssistant, Events: recorded, CreatedAt: l.Now(),
+	}); err != nil {
+		sink.EmitProgress(domain.Progress{
+			Kind: domain.ProgressPlaceholder,
+			Text: "could not record this step's events: " + err.Error(),
+		})
+	}
+}
+
+// eventArgs is a tool call's arguments, in the form the member reads them.
+//
+// FLATTENED AND CAPPED, and the cap is in the harness on purpose: a write_file
+// call's arguments contain the whole file and a shell call's contain the whole
+// command, so an uncapped event log would grow a transcript by everything the
+// agent ever wrote. Capping downstream would save nothing -- the bytes would
+// already be on disk.
+//
+// Whitespace is collapsed first so the cap measures what will be SHOWN rather
+// than the document's indentation, which is most of a pretty-printed argument
+// object and none of its meaning.
+func eventArgs(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	flat := strings.Join(strings.Fields(string(raw)), " ")
+	// Runes, not bytes: a cut through a multi-byte character would put invalid
+	// UTF-8 on disk, and every reader from here to the browser would have to
+	// cope with it.
+	r := []rune(flat)
+	if len(r) <= maxEventArgs {
+		return flat
+	}
+	return string(r[:maxEventArgs]) + "…"
+}
+
+// maxEventArgs is how much of a call's arguments the member is shown. Long
+// enough for a URL, a path, or a short command -- which is what makes a step
+// verifiable -- and far short of a file's contents.
+const maxEventArgs = 200

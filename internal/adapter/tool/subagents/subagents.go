@@ -163,17 +163,44 @@ func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, 
 		tasks = tasks[:t.MaxTasks]
 	}
 
-	return domain.Result{Content: t.run(ctx, mode, tasks)}, nil
+	content, events := t.run(ctx, mode, tasks)
+	return domain.Result{Content: content, Events: events}, nil
 }
 
 // run claims budget, dispatches, and renders.
-func (t *Tool) run(ctx context.Context, mode string, tasks []domain.SubTask) string {
+//
+// TWO AUDIENCES, one dispatch. The string is what the MODEL reads and has always
+// been the whole of this function; the events are what the MEMBER reads
+// afterwards, and they exist because the loop cannot see inside a tool -- it
+// records one event per call, and a call that fans out into four children would
+// otherwise be one line saying "subagents: ok".
+//
+// The narration `say` emits is the live half of the same facts and is
+// deliberately left alone: it is gone the moment the next progress frame
+// replaces it, which is exactly why these are written down.
+func (t *Tool) run(
+	ctx context.Context, mode string, tasks []domain.SubTask,
+) (string, []domain.TurnEvent) {
 	reports, ran, skipped := t.dispatch(ctx, mode, tasks)
 	if len(ran) == 0 {
 		return fmt.Sprintf("%s: this turn's budget of sub-agents is spent, so none of the %d "+
-			"tasks were run. Answer with what you already have, or ask the member.", Name, len(skipped))
+			"tasks were run. Answer with what you already have, or ask the member.", Name, len(skipped)), nil
 	}
-	return render(mode, reports, ran, skipped, t.AnswerRunes)
+	return render(mode, reports, ran, skipped, t.AnswerRunes), childEvents(reports)
+}
+
+// childEvents is one event per child that RAN. A task the budget refused is not
+// one: nothing happened, and a row saying so would read as a child that failed.
+func childEvents(reports []domain.SubReport) []domain.TurnEvent {
+	out := make([]domain.TurnEvent, 0, len(reports))
+	for _, r := range reports {
+		e := domain.TurnEvent{Kind: domain.EventSubagent, Name: r.Label, Status: domain.EventOK}
+		if r.Err != nil {
+			e.Status, e.Detail = domain.EventFailed, r.Err.Error()
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // dispatch is the whole mechanism, without the rendering: claim what the turn's

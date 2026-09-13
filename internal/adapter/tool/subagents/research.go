@@ -88,7 +88,8 @@ func (r *Research) Invoke(ctx context.Context, raw json.RawMessage) (domain.Resu
 		return domain.Result{Content: ResearchName + ": `question` is required."}, nil
 	}
 	if strings.ToLower(strings.TrimSpace(a.Mode)) != "deep" {
-		return domain.Result{Content: r.quick(ctx, q)}, nil
+		content, events := r.quick(ctx, q)
+		return domain.Result{Content: content, Events: events}, nil
 	}
 	breadth := a.Breadth
 	if breadth < minBreadth {
@@ -97,17 +98,21 @@ func (r *Research) Invoke(ctx context.Context, raw json.RawMessage) (domain.Resu
 	if breadth > maxBreadth {
 		breadth = maxBreadth
 	}
-	return domain.Result{Content: r.deep(ctx, q, breadth)}, nil
+	content, events := r.deep(ctx, q, breadth)
+	return domain.Result{Content: content, Events: events}, nil
 }
 
-func (r *Research) quick(ctx context.Context, q string) string {
+// The second return is what the MEMBER reads afterwards, one row per child --
+// the same split subagents.run makes, and for the same reason: the loop records
+// one event per CALL, so a call that ran five children would be one line.
+func (r *Research) quick(ctx context.Context, q string) (string, []domain.TurnEvent) {
 	reports, ran, skipped := r.d.dispatch(ctx, modeParallel, []domain.SubTask{{
 		Label: "research", Task: searchPrompt(q),
 	}})
 	if len(ran) == 0 {
-		return budgetSpent(len(skipped))
+		return budgetSpent(len(skipped)), nil
 	}
-	return findings(q, reports, r.d.AnswerRunes)
+	return findings(q, reports, r.d.AnswerRunes), childEvents(reports)
 }
 
 // deep is three phases, and the third one is NOT here.
@@ -116,20 +121,25 @@ func (r *Research) quick(ctx context.Context, q string) string {
 // TO THE PARENT. A synthesis written by a child would be written by something
 // that has never seen the conversation, and it would answer a question nobody
 // asked -- politely, at length, and in the wrong register.
-func (r *Research) deep(ctx context.Context, q string, breadth int) string {
+func (r *Research) deep(ctx context.Context, q string, breadth int) (string, []domain.TurnEvent) {
 	plan, ran, skipped := r.d.dispatch(ctx, modeParallel, []domain.SubTask{{
 		Label: "plan", Task: decomposePrompt(q, breadth),
 	}})
 	if len(ran) == 0 {
-		return budgetSpent(len(skipped))
+		return budgetSpent(len(skipped)), nil
 	}
+	// The plan's own child counts. It is a sub-agent that ran, and a deep
+	// research whose decomposition failed should not look like one that never
+	// started.
+	events := childEvents(plan)
 
 	subs := subQuestions(plan[0], breadth)
 	if len(subs) == 0 {
 		// The decomposition produced nothing readable. Researching the original
 		// question is a worse answer than a good plan and a much better one
 		// than an error, and it costs the same as quick mode.
-		return r.quick(ctx, q)
+		content, qe := r.quick(ctx, q)
+		return content, append(events, qe...)
 	}
 
 	var tasks []domain.SubTask
@@ -140,7 +150,7 @@ func (r *Research) deep(ctx context.Context, q string, breadth int) string {
 	}
 	reports, ran, skipped := r.d.dispatch(ctx, modeParallel, tasks)
 	if len(ran) == 0 {
-		return budgetSpent(len(skipped))
+		return budgetSpent(len(skipped)), events
 	}
 
 	out := findings(q, reports, r.d.AnswerRunes)
@@ -148,7 +158,7 @@ func (r *Research) deep(ctx context.Context, q string, breadth int) string {
 		out += fmt.Sprintf("\n%d sub-question(s) were not researched: this turn's sub-agent "+
 			"budget ran out.\n", len(skipped))
 	}
-	return out
+	return out, append(events, childEvents(reports)...)
 }
 
 func budgetSpent(n int) string {
