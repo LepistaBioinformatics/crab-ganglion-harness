@@ -153,20 +153,15 @@ func main() {
 			},
 			Logf: logger.Printf,
 		},
-		MaxIterations:   cfg.MaxTurnIter,
+		MaxIterations:   turnIterations(reg, cfg),
 		ApprovalTimeout: cfg.ApprovalTimeout,
 		MaxChildren:     reg.Subturn.MaxChildrenPerTurn,
 	}
-	// Said at boot, with the EFFECTIVE number rather than the configured one.
-	// GANGLION_MAX_ITERATIONS is the only bound an operator has on a long task,
-	// and "did my value reach the loop" was unanswerable from outside the
-	// container -- which is how a cap nothing was injecting went unnoticed until
-	// somebody's turn stopped in the middle of one.
-	iterations := cfg.MaxTurnIter
-	if iterations <= 0 {
-		iterations = runtime.DefaultMaxIterations
-	}
-	logger.Printf("turns: up to %d iterations each (GANGLION_MAX_ITERATIONS)", iterations)
+	// Said at boot, with the EFFECTIVE number and where it came from. "Did my
+	// value reach the loop" was unanswerable from outside the container, which
+	// is how a cap nothing was injecting went unnoticed until somebody's turn
+	// stopped in the middle of one.
+	logger.Printf("turns: up to %d iterations each (%s)", loop.MaxIterations, iterationsSource(reg, cfg))
 
 	// Tools are assigned AFTER the loop exists, because one of them dispatches
 	// child turns and therefore needs the loop that would run them. The child
@@ -598,4 +593,42 @@ func mcpTools(
 		logger.Printf("mcp: server %q connected, %d tools", srv.Name, len(remote))
 	}
 	return out, clients, nil
+}
+
+// turnIterations resolves how many times one turn may come back for another
+// tool, and the ORDER is the whole of it: the config file wins, then the
+// environment, then the loop's own default.
+//
+// File first, which is the opposite of how this harness resolves model keys --
+// and deliberately. That rule exists because a KEY is a secret and the file is
+// on a volume that gets backed up; a tuning number is neither. It is also the
+// only order that matches how an operator reaches each one: the file is what
+// the admin config screen edits, per agent and in bulk, and the variable is the
+// blunt instrument for a deployment with no screen in front of it.
+//
+// Read once, at boot, and that is enough: crab-shell-proxy recreates the
+// container when the rendered config file's bytes change, so an admin's edit
+// arrives as a new process rather than as a value this one has to notice.
+func turnIterations(reg config.Registry, cfg config.Config) int {
+	if reg.MaxToolIterations > 0 {
+		return reg.MaxToolIterations
+	}
+	if cfg.MaxTurnIter > 0 {
+		return cfg.MaxTurnIter
+	}
+	return runtime.DefaultMaxIterations
+}
+
+// iterationsSource names where the effective cap came from, for the boot line.
+// The number alone is not enough to debug with: "12" looks the same whether the
+// operator set it, the file set it, or nothing did.
+func iterationsSource(reg config.Registry, cfg config.Config) string {
+	switch {
+	case reg.MaxToolIterations > 0:
+		return "agents.defaults.max_tool_iterations"
+	case cfg.MaxTurnIter > 0:
+		return "GANGLION_MAX_ITERATIONS"
+	default:
+		return "built-in default"
+	}
 }
