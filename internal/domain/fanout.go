@@ -113,3 +113,78 @@ func SinkFrom(ctx context.Context) Sink {
 	s, _ := ctx.Value(sinkKey{}).(Sink)
 	return s
 }
+
+// --- the turn's event log ---------------------------------------------------
+
+// Recorder collects what one turn DID, for the member to read afterwards.
+//
+// On the context for the same reason the sink is: the two places that make an
+// event -- the fallback ladder and the depth change -- are several frames below
+// the loop that owns the slice, and threading a pointer through four signatures
+// would say nothing the context does not already say.
+//
+// A mutex although the loop is sequential: the sub-agent dispatcher fans out,
+// and although it reports through Result.Events rather than reaching for this,
+// a future tool that did reach for it must not be a data race nobody noticed.
+type Recorder struct {
+	mu     sync.Mutex
+	events []TurnEvent
+}
+
+func (r *Recorder) Add(e TurnEvent) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+// Finish stamps the outcome on the event most recently added -- which is always
+// the call this is reporting on, because the loop adds a tool's event
+// immediately before invoking it and nothing else runs in between.
+//
+// A method rather than "add a second event when it ends": one call is one line
+// on screen, and splitting it into a start and a finish would double the list
+// and make the member reconstruct the pairing.
+func (r *Recorder) Finish(status, detail string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.events) == 0 {
+		return
+	}
+	last := &r.events[len(r.events)-1]
+	last.Status = status
+	if detail != "" {
+		last.Detail = detail
+	}
+}
+
+// Take returns what has been collected and empties the log, so the next
+// iteration starts clean. The loop flushes once per iteration.
+func (r *Recorder) Take() []TurnEvent {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.events
+	r.events = nil
+	return out
+}
+
+type recorderKey struct{}
+
+func WithRecorder(ctx context.Context, r *Recorder) context.Context {
+	return context.WithValue(ctx, recorderKey{}, r)
+}
+
+// RecorderFrom returns the turn's recorder, or nil -- whose Add and Take are
+// already nil-safe, so a caller never has to check.
+func RecorderFrom(ctx context.Context) *Recorder {
+	r, _ := ctx.Value(recorderKey{}).(*Recorder)
+	return r
+}

@@ -123,8 +123,17 @@ func conversational(msgs []domain.Message) []domain.Message {
 		if m.Role == domain.RoleTool {
 			continue
 		}
+		// An events-only entry is dropped whole rather than emptied. It has no
+		// content, so what survives the strip below is an assistant message
+		// saying nothing -- which some providers reject outright and none can
+		// use. Events are written for the member; the model already knows what
+		// it did, because the tool results were in the window at the time.
+		if m.Content == "" && len(m.Events) > 0 {
+			continue
+		}
 		m.ToolCalls = nil
 		m.ToolCallID = ""
+		m.Events = nil
 		out = append(out, m)
 	}
 	return out

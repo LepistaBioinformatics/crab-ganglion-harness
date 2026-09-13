@@ -47,10 +47,19 @@ func TestRun_ATurnOfTwoIterationsIsTwoTranscriptMessages(t *testing.T) {
 	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(tr.log) != 3 {
-		t.Fatalf("transcript has %d entries, want user + step + answer: %+v", len(tr.log), tr.log)
+	// Four: the question, the narration, the iteration's EVENTS, and the answer.
+	// The events entry is the same iteration's detail rather than a second thing
+	// the agent said, which is why it carries no content.
+	if len(tr.log) != 4 {
+		t.Fatalf("transcript has %d entries, want user + step + events + answer: %+v", len(tr.log), tr.log)
 	}
-	step, answer := tr.log[1], tr.log[2]
+	step, events, answer := tr.log[1], tr.log[2], tr.log[3]
+	if events.Content != "" || len(events.Events) != 1 || events.Events[0].Name != "sh" {
+		t.Errorf("the iteration's events are not durable: %+v", events)
+	}
+	if events.Events[0].Status != domain.EventOK {
+		t.Errorf("the call ended %q, want %q", events.Events[0].Status, domain.EventOK)
+	}
 	if step.Content != "Vou olhar o projeto." || len(step.ToolCalls) != 1 {
 		t.Errorf("the narration is not a step: %+v", step)
 	}
@@ -173,8 +182,13 @@ func TestRun_AnInterruptedTurnLeavesTheMemberWhatWasSaid(t *testing.T) {
 		t.Fatal("expected the provider failure to surface")
 	}
 
-	if len(tr.log) != 2 || tr.log[1].Content != "Vou olhar o projeto." {
+	// The narration, then the iteration's events. Both survive the frame that
+	// died after them, which is the whole point of writing each as it lands.
+	if len(tr.log) != 3 || tr.log[1].Content != "Vou olhar o projeto." {
 		t.Fatalf("the step the member watched go by is not durable: %+v", tr.log)
+	}
+	if len(tr.log[2].Events) != 1 || tr.log[2].Events[0].Name != "sh" {
+		t.Errorf("the tool the step ran is not durable: %+v", tr.log[2])
 	}
 	if len(cp.writes) == 0 {
 		t.Fatal("the interrupted frame was never checkpointed")
@@ -184,7 +198,7 @@ func TestRun_AnInterruptedTurnLeavesTheMemberWhatWasSaid(t *testing.T) {
 		t.Errorf("the sidecar holds %q; it stands in for the frame that died, not for the whole turn -- "+
 			"seeding it with the steps already written shows them twice after a crash", cp.writes[last])
 	}
-	if !cp.dates[last].After(tr.log[1].CreatedAt) {
+	if !cp.dates[last].After(tr.log[2].CreatedAt) {
 		t.Errorf("the sidecar answers at %v and the step before it is dated %v: every reader will call it stale",
 			cp.dates[last], tr.log[1].CreatedAt)
 	}
@@ -195,11 +209,16 @@ func TestRun_AnInterruptedTurnLeavesTheMemberWhatWasSaid(t *testing.T) {
 	}
 }
 
-// A frame that asked for a tool without saying anything writes NOTHING to the
-// transcript. An assistant message with no text is dropped by the proxy's
-// history reader anyway, so writing one would leave a step that renders as an
-// empty band between the question and the answer.
-func TestRun_ASilentToolCallIsNotAStep(t *testing.T) {
+// A frame that asked for a tool without saying anything used to write NOTHING,
+// because an assistant message with no text is dropped by the proxy's history
+// reader and writing one would have left an empty band between the question and
+// the answer.
+//
+// It is visible now, and it is the EVENTS that make it so: the entry has no
+// content and the proxy keeps it because it carries events. Before this the work
+// simply vanished -- the member saw ten steps for a turn that had run fourteen
+// tools, with no way to tell which ones.
+func TestRun_ASilentToolCallIsRecordedAsEvents(t *testing.T) {
 	tr := &fakeTranscript{}
 	p := &fakeProvider{turns: []fakeTurn{
 		{msg: domain.Message{Role: domain.RoleAssistant, ToolCalls: []domain.ToolCall{{ID: "1", Name: "sh", Args: args(`{}`)}}}},
@@ -210,7 +229,14 @@ func TestRun_ASilentToolCallIsNotAStep(t *testing.T) {
 	if _, err := l.Run(context.Background(), turn(), domain.Sink{}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(tr.log) != 2 {
-		t.Fatalf("transcript has %d entries, want user + answer: %+v", len(tr.log), tr.log)
+	if len(tr.log) != 3 {
+		t.Fatalf("transcript has %d entries, want user + events + answer: %+v", len(tr.log), tr.log)
+	}
+	silent := tr.log[1]
+	if silent.Content != "" {
+		t.Errorf("the events entry says %q; it is the iteration's detail, not a second thing said", silent.Content)
+	}
+	if len(silent.Events) != 1 || silent.Events[0].Kind != domain.EventTool || silent.Events[0].Name != "sh" {
+		t.Errorf("the silent call left %+v, want one tool event naming sh", silent.Events)
 	}
 }

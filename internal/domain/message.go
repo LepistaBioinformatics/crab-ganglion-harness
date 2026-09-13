@@ -71,9 +71,58 @@ type Message struct {
 	Attachments []Attachment
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID links a RoleTool message back to the call it answers.
-	ToolCallID string    `json:"tool_call_id,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Events is what the loop DID during one iteration, written for the member
+	// rather than for the model. A message carrying them carries no content: it
+	// is the iteration's detail, not a second thing the agent said.
+	//
+	// It never reaches a provider. The window is rebuilt from the served history
+	// without it (see window.rebuild, which already strips the display-only
+	// tool_calls for the same reason), and the wire adapter sends role and
+	// content.
+	Events    []TurnEvent `json:"events,omitempty"`
+	CreatedAt time.Time   `json:"created_at"`
 }
+
+// TurnEvent is one thing the loop did, in the form the member reads it.
+//
+// ONE FLAT SHAPE for every kind, because the client renders them as one list: a
+// per-kind union would be four types the webapp has to switch on to draw four
+// lines that differ only in their icon.
+//
+// Nothing here is a sentence. The harness has no locale -- it does not know
+// which language the member reads -- so every word on screen is rendered by the
+// client from these fields, and the fields that ARE free text (Name, Arguments,
+// Detail) are data that is shown verbatim in either language.
+type TurnEvent struct {
+	// Kind is one of the constants below.
+	Kind string `json:"kind"`
+	// Name is the tool's name, the child's label, or the model's name.
+	Name string `json:"name,omitempty"`
+	// Arguments is the call's arguments, FLATTENED AND CAPPED -- see
+	// runtime.eventArgs. A string rather than json.RawMessage precisely because
+	// it is truncated: a cut-off JSON document is not JSON, and typing it as raw
+	// would put a value on disk that every reader has to defend against. It is a
+	// display string from the moment it is written.
+	Arguments string `json:"arguments,omitempty"`
+	// Status is how it ended. Empty for a kind that has no outcome, and for a
+	// call whose outcome was never recorded -- a turn that died mid-tool.
+	Status string `json:"status,omitempty"`
+	// Detail is the failure's text, the depth's reason, or the fallback's cause.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Event kinds and statuses, named so a typo is a compile error.
+const (
+	EventTool     = "tool"
+	EventSubagent = "subagent"
+	EventModel    = "model"
+	EventDepth    = "depth"
+
+	EventOK     = "ok"
+	EventDenied = "denied"
+	EventFailed = "failed"
+)
 
 // ToolCall is one requested invocation.
 type ToolCall struct {
@@ -97,6 +146,16 @@ type Result struct {
 	// Denied marks a result produced by the approval path rather than by running
 	// the tool.
 	Denied bool
+	// Events is work the tool did that the loop cannot see. The loop records one
+	// event per CALL; a tool that fans out -- the sub-agent dispatcher is the
+	// only one -- reports what happened inside it here, and the loop appends
+	// whatever it is handed.
+	//
+	// This is what keeps the loop generic: no tool is named in it. The field is
+	// returned by value all the way up (Registry.Invoke returns t.Invoke(...),
+	// filtered.Invoke returns f.inner.Invoke(...)), so nothing rebuilds the
+	// struct and drops it.
+	Events []TurnEvent
 	// Attachments are media the tool produced for the MODEL to look at, not for
 	// the member. A tool result cannot carry them itself -- most providers
 	// reject image parts on a `tool` role message -- so the loop turns them into
