@@ -34,6 +34,10 @@ type Server struct {
 	Logf      func(string, ...any)
 
 	handler domain.TurnHandler
+
+	// One turn at a time per conversation. See claim.
+	turnsMu sync.Mutex
+	turns   map[string]chan struct{}
 }
 
 const DefaultHeartbeat = 10 * time.Second
@@ -125,6 +129,32 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 	sw := &writer{w: w, f: flusher, id: req.id(), model: req.Model}
 	stop := sw.heartbeat(r.Context(), s.Heartbeat)
 	defer stop()
+
+	// ONE TURN AT A TIME on a conversation, and the wait is AFTER the headers and
+	// the heartbeat so the connection survives it.
+	//
+	// Nothing used to serialize this -- not here, not in crab-shell-proxy's chat
+	// handler, not in its ganglion runner. Two POSTs on one conversation were two
+	// concurrent Loop.Run, and the damage was not theoretical: each one loads the
+	// context window, appends its iterations and saves, so the second save
+	// overwrote the first turn's work. The agent forgot what it had just done.
+	//
+	// It was reachable in production. The webapp's client-side queue is what kept
+	// a second message from being POSTed mid-turn, and that queue lives in module
+	// scope in the browser -- a reload wipes it, so the next message after a
+	// reload went straight through.
+	//
+	// WAIT rather than refuse. A refusal would need the member to resend, and the
+	// thing they are waiting for is a turn they cannot see; queueing is what the
+	// browser's own queue does when it is there, so a reloaded page now behaves
+	// like one that was never reloaded.
+	release, ok := s.claim(r.Context(), req.sessionID(r))
+	if !ok {
+		// The request went away while it waited. Nothing was started, so there is
+		// nothing to unwind -- and no [DONE], because nobody is reading.
+		return
+	}
+	defer release()
 
 	turn := domain.Turn{
 		SessionID:  domain.ConversationID(req.sessionID(r)),
@@ -360,4 +390,49 @@ func (s *writer) done() {
 	fmt.Fprint(s.w, "data: [DONE]\n\n")
 	s.f.Flush()
 	s.closed = true
+}
+
+// claim serializes turns on one conversation, waiting for the one in flight.
+//
+// A channel per conversation rather than a mutex, because the wait has to be
+// INTERRUPTIBLE: the caller's context dies when the proxy's turn budget runs out
+// or the member navigates away, and a goroutine parked on a mutex cannot notice.
+// Closing the channel is the release, so every waiter wakes at once and races for
+// the next claim -- a queue of two is the realistic case, and ordering between
+// waiters is not something this layer can promise anyway.
+//
+// The conversation is dropped from the map on release, so the map holds only what
+// is running. A per-user container has one member and a handful of conversations;
+// nothing here needs to be cleverer than that.
+//
+// Returns false when the wait was cut short. The caller has started nothing.
+func (s *Server) claim(ctx context.Context, id string) (func(), bool) {
+	for {
+		s.turnsMu.Lock()
+		if s.turns == nil {
+			s.turns = map[string]chan struct{}{}
+		}
+		running, busy := s.turns[id]
+		if !busy {
+			done := make(chan struct{})
+			s.turns[id] = done
+			s.turnsMu.Unlock()
+			return func() {
+				s.turnsMu.Lock()
+				delete(s.turns, id)
+				s.turnsMu.Unlock()
+				close(done)
+			}, true
+		}
+		s.turnsMu.Unlock()
+
+		select {
+		case <-running:
+			// The turn ahead finished. Round again rather than claiming here:
+			// another waiter may have taken it first, and this is the only place
+			// that decides who holds it.
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
 }
