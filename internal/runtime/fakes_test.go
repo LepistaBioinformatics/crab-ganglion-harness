@@ -53,11 +53,16 @@ type fakeStream struct {
 	i int
 }
 
+// Next yields the deltas and only then fails, which is what a real stream does:
+// a provider that dies mid-answer has already sent part of it. A turn with no
+// deltas and an err still fails on the first call, so this is a superset of
+// what it did before -- and the difference is the only way to script the case
+// the buffering in complete has to get right.
 func (s *fakeStream) Next(context.Context) (domain.Delta, error) {
-	if s.t.err != nil {
-		return domain.Delta{}, s.t.err
-	}
 	if s.i >= len(s.t.deltas) {
+		if s.t.err != nil {
+			return domain.Delta{}, s.t.err
+		}
 		return domain.Delta{}, io.EOF
 	}
 	d := domain.Delta{Content: s.t.deltas[s.i]}

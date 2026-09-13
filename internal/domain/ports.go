@@ -158,6 +158,12 @@ type TranscriptStore interface {
 // Checkpointer records an answer that is still streaming, so a turn that dies
 // mid-stream does not lose what the member already watched appear.
 //
+// answersAt is the instant the message being written began, and a sidecar is
+// stale once the transcript holds an assistant message at or after it. That is
+// the whole of the supersession rule, and it is stated in terms of ONE MESSAGE
+// rather than one turn on purpose: the loop writes one per iteration, so a turn
+// checkpoints several times against several instants.
+//
 // Separate from TranscriptStore on purpose. TranscriptStore's whole value is
 // that it CANNOT rewrite anything; a checkpoint is rewritten constantly. Two
 // interfaces keep that distinction enforceable instead of a comment -- and a

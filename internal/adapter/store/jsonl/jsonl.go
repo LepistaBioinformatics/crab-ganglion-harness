@@ -96,10 +96,17 @@ func (s *Store) partialPath(ctx context.Context, id domain.ConversationID) strin
 
 // Partial is an answer that was still streaming.
 type Partial struct {
-	// AnswersAt is the created_at of the user message this turn is answering.
+	// AnswersAt is the instant the frame this sidecar stands in for began.
 	// It is what decides whether the sidecar is live, with no turn id needed:
 	// a sidecar is stale once the transcript holds an assistant message at or
 	// after this instant.
+	//
+	// It was the created_at of the member's question while a turn wrote one
+	// assistant message at its end. The harness now appends one per ITERATION,
+	// so "the turn answered" and "this frame is durable" stopped being the same
+	// event: dated by the question, the first narration step would supersede
+	// every checkpoint that followed it. The rule below is unchanged -- only
+	// what the caller dates it by, and the loop's own comment says so.
 	AnswersAt time.Time `json:"answers_at"`
 	Content   string    `json:"content"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -262,6 +269,12 @@ func readTranscript(path string) ([]domain.Message, error) {
 // The partial's text is appended as-is, with no marker. It is what the member
 // watched appear; an answer cut mid-sentence already reads as cut, and a marker
 // field would be invisible to internal/history's parser anyway (H-2).
+//
+// It is folded as an ANSWER -- no tool_calls, so no step -- because nothing
+// knows what the dead frame would have become: the calls it was about to ask
+// for are exactly the part that never arrived. The steps it followed are
+// already in the transcript as themselves, so what is recovered here is only
+// the piece that had no ending.
 func (s *Store) RecoverPartials(ctx context.Context) (folded, dropped int, err error) {
 	f, d, err := s.recoverIn(ctx)
 	folded, dropped = f, d

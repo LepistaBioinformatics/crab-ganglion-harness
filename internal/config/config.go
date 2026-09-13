@@ -67,6 +67,23 @@ type Config struct {
 // as a 404 from the provider rather than as a configuration error -- a lesson
 // the Hermes work paid for.
 func Load() (Config, error) {
+	// The turn's iteration cap. Read here, carried to Loop.MaxIterations by
+	// cmd/crab-ganglion, and enforced by the loop's `for i < MaxIterations`.
+	//
+	// UNSET IS ZERO, not twelve: the number lives in exactly one place
+	// (runtime.DefaultMaxIterations, which the loop applies to a zero field),
+	// and a second copy here would be a default that can drift from the one
+	// actually in force without anything noticing.
+	//
+	// It is the only bound an operator has on a long task, and until
+	// crab-shell-proxy injects it there is no way to raise it on a
+	// proxy-managed container -- so a value that cannot be honoured says so at
+	// boot instead of being silently replaced by the default the operator was
+	// trying to leave behind.
+	iterations, err := envPositive("GANGLION_MAX_ITERATIONS")
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
 		Addr:             env("GANGLION_ADDR", ":18800"),
 		AuthToken:        os.Getenv("GANGLION_TOKEN"),
@@ -81,7 +98,7 @@ func Load() (Config, error) {
 		SkillsRoot:       os.Getenv("GANGLION_SKILLS_ROOT"),
 		Lifecycle:        os.Getenv("GANGLION_LIFECYCLE_MODE"),
 		DataDir:          env("GANGLION_DATA_DIR", "/data/.ganglion"),
-		MaxTurnIter:      envInt("GANGLION_MAX_ITERATIONS", 12),
+		MaxTurnIter:      iterations,
 		ApprovalEndpoint: os.Getenv("GANGLION_APPROVAL_ENDPOINT"),
 		ApprovalTimeout:  time.Duration(envInt("GANGLION_APPROVAL_TIMEOUT_SECONDS", 300)) * time.Second,
 		OTLPEndpoint:     os.Getenv("GANGLION_OTLP_ENDPOINT"),
@@ -149,6 +166,26 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envPositive reads a variable that must name a positive count, and answers 0
+// when it is unset.
+//
+// Loud rather than defaulted, which envInt below is not. The difference is what
+// the caller does with a value it cannot use: a bad approval timeout degrades to
+// a sane one, while a bad iteration cap would silently reinstate the very
+// default the operator was raising -- and they would find out from a turn that
+// stopped early, hours later, with nothing naming the cause.
+func envPositive(k string) (int, error) {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s must be a positive whole number of iterations, got %q", k, v)
+	}
+	return n, nil
 }
 
 func envInt(k string, def int) int {

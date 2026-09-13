@@ -157,6 +157,16 @@ func main() {
 		ApprovalTimeout: cfg.ApprovalTimeout,
 		MaxChildren:     reg.Subturn.MaxChildrenPerTurn,
 	}
+	// Said at boot, with the EFFECTIVE number rather than the configured one.
+	// GANGLION_MAX_ITERATIONS is the only bound an operator has on a long task,
+	// and "did my value reach the loop" was unanswerable from outside the
+	// container -- which is how a cap nothing was injecting went unnoticed until
+	// somebody's turn stopped in the middle of one.
+	iterations := cfg.MaxTurnIter
+	if iterations <= 0 {
+		iterations = runtime.DefaultMaxIterations
+	}
+	logger.Printf("turns: up to %d iterations each (GANGLION_MAX_ITERATIONS)", iterations)
 
 	// Tools are assigned AFTER the loop exists, because one of them dispatches
 	// child turns and therefore needs the loop that would run them. The child

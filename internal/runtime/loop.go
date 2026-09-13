@@ -183,22 +183,34 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	window.Messages = append(window.Messages, in)
 
 	// What the member sees, accumulated across every iteration of this turn.
+	// It is what Run returns, what the Learner records, and nothing else: the
+	// transcript is written one message per ITERATION, as each one lands.
 	//
-	// The transcript records ONE assistant message per turn, holding exactly
-	// this. That is not a simplification -- it is what makes the served
-	// history match the stream.
+	// THE RULE THIS TURNS ON: the reply visibly rewrites itself IFF the live
+	// stream's content/progress partition differs from the transcript's message
+	// partition. Both have to move together or neither may.
 	//
-	// The stream is one continuous run of content: an iteration's narration,
-	// then tool progress, then the next iteration's text, all into one bubble.
-	// Writing the transcript per iteration instead produced a DIFFERENT shape
-	// -- crab-shell-proxy marks an assistant message carrying tool_calls as a
-	// "step" -- so when the turn ended and the client reconciled against the
-	// transcript, the single bubble was torn into narration plus answer and
-	// the whole reply visibly rewrote itself.
+	// One message per turn was the first way of making them agree. Per-iteration
+	// writes while narration still streamed as ordinary content tore the single
+	// bubble into narration plus answer the moment the client reconciled --
+	// crab-shell-proxy marks an assistant message carrying tool_calls as a
+	// "step" -- so the transcript was collapsed to match the stream. It agreed by
+	// DELETING THE STEPS: a ganglion turn rendered as one block of concatenated
+	// text with its narration inlined, and the proxy's marker became dead code
+	// for every conversation this harness serves.
 	//
-	// Tool calls and results still reach the PROVIDER: they go into the
-	// context window, which is a separate artifact built separately below.
-	// Only the served history is collapsed.
+	// So both partitions moved instead. An iteration that ends in tool calls is
+	// narration by definition: its text leaves the content run entirely and goes
+	// out as progress (see complete, which buffers it, and the ProgressTool frame
+	// runTool emits), and the iteration is written as its own message carrying
+	// its tool_calls. The iteration that ends without them is the answer, and it
+	// is the only one that streams as content.
+	//
+	// Tool RESULTS still reach the provider and only the provider: they go into
+	// the context window, which is a separate artifact built separately below.
+	// The tool_calls the transcript carries are a display marker with no results
+	// behind them -- see window.rebuild, which strips them before a window is
+	// ever rebuilt from the served history.
 	var answer strings.Builder
 	var total domain.Usage
 	// Collected for the Learner. Nothing else reads it, and it costs one
@@ -220,10 +232,18 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	}
 
 	for i := 0; i < c.MaxIterations; i++ {
-		msg, usage, err := c.completeWithFallback(ctx, t, window, sink, in.CreatedAt, answer.String())
+		// The instant this ITERATION began. It dates the checkpoint sidecar,
+		// which now stands in for one frame rather than for a whole turn -- see
+		// complete, where the supersession rule that depends on it is written
+		// out.
+		began := c.Now()
+		msg, usage, err := c.completeWithFallback(ctx, t, window, sink, began)
 		if err != nil {
 			runErr = err
 			sink.EmitError(err.Error())
+			// Nothing is appended: every earlier iteration is already a durable
+			// message of its own, and what THIS one produced before it died is
+			// in the sidecar, which is where an interrupted frame belongs.
 			observe(true)
 			return answer.String(), runErr
 		}
@@ -232,15 +252,18 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		msg.CreatedAt = c.Now()
 		// The WINDOW gets the message as the PROVIDER needs it: content and
 		// tool_calls together, so the tool results below answer a call it can
-		// see. The transcript gets one message for the whole turn, at the end.
+		// see. The TRANSCRIPT gets its own copy here rather than at the end of
+		// the turn, and BEFORE the tools run: a tool call is the part of a turn
+		// that can take minutes and die, and the sentence explaining why it was
+		// made has to survive that.
 		window.Messages = append(window.Messages, msg)
 		answer.WriteString(msg.Content)
+		if ferr := c.record(ctx, t, msg); ferr != nil {
+			runErr = ferr
+			return answer.String(), runErr
+		}
 
 		if len(msg.ToolCalls) == 0 {
-			if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
-				runErr = ferr
-				return answer.String(), runErr
-			}
 			c.recordUsage(ctx, total, t)
 			window = compact(window, c.WindowBudget)
 			runErr = c.Context.Save(ctx, t.SessionID, window)
@@ -267,7 +290,12 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 
 		for _, call := range msg.ToolCalls {
 			chosen := depth.Level()
-			res, err := c.runTool(ctx, t, call, sink)
+			// msg.Content is this iteration's NARRATION, and runTool is where it
+			// reaches the member: it rides on the tool frame rather than on a
+			// frame of its own because the client shows the latest progress
+			// event and nothing else, so a separate narration frame would be
+			// wiped by the tool frame that follows it a millisecond later.
+			res, err := c.runTool(ctx, t, call, msg.Content, sink)
 			// Said out loud when it changes. A turn that suddenly takes four
 			// times as long, and costs four times as much, is owed a sentence
 			// saying the agent decided the question was hard -- and the reason
@@ -283,7 +311,8 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			if err != nil {
 				runErr = err
 				sink.EmitError(err.Error())
-				_ = c.finishTurn(ctx, t, answer.String())
+				// No transcript write here any more: the narration that led to
+				// this call was appended before the call ran.
 				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
 				observe(true)
 				return answer.String(), runErr
@@ -323,7 +352,6 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		window = compact(window, c.WindowBudget)
 		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
 			runErr = fmt.Errorf("save context: %w", err)
-			_ = c.finishTurn(ctx, t, answer.String())
 			return answer.String(), runErr
 		}
 	}
@@ -335,44 +363,56 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// something, but it did not finish the work -- counting it as a success
 	// would teach the pattern that whatever it was doing works.
 	observe(true)
-	if ferr := c.finishTurn(ctx, t, answer.String()); ferr != nil {
-		return answer.String(), ferr
-	}
+	// Nothing to finish: the last iteration's narration was appended when it
+	// arrived, like every one before it.
 	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
 		return answer.String(), saveErr
 	}
 	return answer.String(), nil
 }
 
-// finishTurn writes the turn's single assistant message and clears the
-// checkpoint that was standing in for it.
+// record writes ONE ITERATION's assistant message and clears the checkpoint
+// that was standing in for it.
 //
-// Called on every exit path that produced text, including the failing ones:
-// a turn that died after saying something still said it.
-func (l *Loop) finishTurn(ctx context.Context, t domain.Turn, answer string) error {
-	if answer == "" {
-		// Nothing was said. Clear any checkpoint so a later reader does not
-		// resurrect a fragment of a turn that produced no answer.
-		if l.Checkpoints != nil {
-			_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
-		}
+// Called as each frame lands, including on the paths the turn then fails on: a
+// turn that died after saying something still said it, and after three
+// iterations it has said three things rather than one.
+//
+// The tool_calls are carried because they ARE the step marker -- the only thing
+// crab-shell-proxy reads to tell narration from an answer
+// (internal/history/history.go, KindStep). The reasoning is not: it was already
+// delivered as progress while the frame streamed, and a second copy on the
+// message would show the member the same thoughts twice.
+func (l *Loop) record(ctx context.Context, t domain.Turn, msg domain.Message) error {
+	if msg.Content == "" {
+		// Nothing was said. A frame that only asked for a tool is not a step
+		// anybody can see -- the proxy's history reader drops an entry with no
+		// text -- so writing it would put an empty band in the served history.
+		// The sidecar is cleared for the reason it always was: a later reader
+		// must not resurrect a fragment of a frame that produced no text.
+		l.clearPartial(ctx, t)
 		return nil
 	}
-	msg := domain.Message{
+	if err := l.Transcript.Append(ctx, t.SessionID, domain.Message{
 		Role:      domain.RoleAssistant,
-		Content:   answer,
-		CreatedAt: l.Now(),
-	}
-	if err := l.Transcript.Append(ctx, t.SessionID, msg); err != nil {
+		Content:   msg.Content,
+		ToolCalls: msg.ToolCalls,
+		CreatedAt: msg.CreatedAt,
+	}); err != nil {
 		return fmt.Errorf("append assistant message: %w", err)
 	}
-	// D-3. The real message is durable now, so the sidecar is stale. A failed
-	// clear is ignored: it leaves a leftover the supersession rule already
-	// hides, and failing here would trade that for a lost answer.
+	l.clearPartial(ctx, t)
+	return nil
+}
+
+// clearPartial drops the sidecar standing in for a frame that is now durable.
+//
+// D-3. A failed clear is ignored: it leaves a leftover the supersession rule
+// already hides, and failing here would trade that for a lost answer.
+func (l *Loop) clearPartial(ctx context.Context, t domain.Turn) {
 	if l.Checkpoints != nil {
 		_ = l.Checkpoints.ClearPartial(ctx, t.SessionID)
 	}
-	return nil
 }
 
 // completeWithFallback walks the turn's candidate models until one answers.
@@ -388,9 +428,9 @@ func (l *Loop) finishTurn(ctx context.Context, t domain.Turn, answer string) err
 // attempt failed, and a wrapper that said "all 3 models failed" would bury it.
 func (l *Loop) completeWithFallback(
 	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
-	answersAt time.Time, alreadySaid string,
+	answersAt time.Time,
 ) (domain.Message, domain.Usage, error) {
-	msg, usage, err := l.tryChain(ctx, t, w, sink, answersAt, alreadySaid, l.modelsFor(ctx, t, w))
+	msg, usage, err := l.tryChain(ctx, t, w, sink, answersAt, l.modelsFor(ctx, t, w))
 	if err == nil || !hasAttachments(w) {
 		return msg, usage, err
 	}
@@ -417,18 +457,18 @@ func (l *Loop) completeWithFallback(
 		Content: "An image was attached to this conversation and no configured model could read it. " +
 			"Answer from the text, and say plainly that you could not see the image.",
 	}}, stripped.Messages...)
-	return l.tryChain(ctx, t, stripped, sink, answersAt, alreadySaid, l.modelsFor(ctx, t, domain.Window{}))
+	return l.tryChain(ctx, t, stripped, sink, answersAt, l.modelsFor(ctx, t, domain.Window{}))
 }
 
 // tryChain walks one ordered list of candidates.
 func (l *Loop) tryChain(
 	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
-	answersAt time.Time, alreadySaid string, chain []string,
+	answersAt time.Time, chain []string,
 ) (domain.Message, domain.Usage, error) {
 	var lastErr error
 	depth := domain.DepthFrom(ctx)
 	for i, model := range chain {
-		msg, usage, emitted, err := l.complete(ctx, t, w, sink, answersAt, alreadySaid, model)
+		msg, usage, emitted, err := l.complete(ctx, t, w, sink, answersAt, model)
 
 		// THE DEPTH DEGRADATION, and it is the same argument the image
 		// degradation above makes. A model that rejects `reasoning_effort`
@@ -442,7 +482,7 @@ func (l *Loop) tryChain(
 		// attempt would splice two answers into one bubble.
 		if err != nil && !emitted && l.sendsThinking(model) && !depth.Suppressed(model) {
 			depth.Suppress(model)
-			msg, usage, emitted, err = l.complete(ctx, t, w, sink, answersAt, alreadySaid, model)
+			msg, usage, emitted, err = l.complete(ctx, t, w, sink, answersAt, model)
 		}
 
 		if err == nil {
@@ -608,15 +648,16 @@ func stripAttachments(w domain.Window) domain.Window {
 	return out
 }
 
-// complete runs one provider call, streaming its deltas to the sink.
+// complete runs one provider call, delivering what it produces to the sink.
 //
 // The reported bool is "did anything reach the member": it is what makes the
-// fallback above safe, and it is true from the first content delta, not from
-// the first byte off the socket -- a provider that returns headers and then
-// dies has emitted nothing the member can see.
+// fallback above safe. It is true once the frame has been delivered -- as
+// content, or as the tool calls the caller narrates -- and not from the first
+// byte off the socket, because a provider that returns headers and then dies
+// has emitted nothing the member can see.
 func (l *Loop) complete(
 	ctx context.Context, t domain.Turn, w domain.Window, sink domain.Sink,
-	answersAt time.Time, alreadySaid string, model string,
+	answersAt time.Time, model string,
 ) (domain.Message, domain.Usage, bool, error) {
 	ctx, end := l.span(ctx, "provider.complete", domain.Attr{Key: "model", Value: model})
 	var err error
@@ -646,32 +687,31 @@ func (l *Loop) complete(
 	}
 	defer stream.Close()
 
-	// Seeded with what earlier iterations of this turn already said, so a
-	// checkpoint recovers the whole answer rather than only its last leg.
-	var partial strings.Builder
-	partial.WriteString(alreadySaid)
+	// THE FRAME'S CONTENT IS HELD UNTIL THE FRAME ENDS, and that is the price
+	// the visible steps are bought with rather than an oversight.
+	//
+	// An iteration's text is NARRATION when the frame ends in tool calls and the
+	// ANSWER when it does not, and nothing says which until it ends: Delta
+	// carries content and reasoning only, Stream.Message is valid only after
+	// io.EOF, and "no call has appeared yet" is not evidence -- crab-shell-proxy
+	// measured 7 turns in 112 delivering a whole reply in the same frame as a
+	// trailing call. Emitting optimistically and re-marking afterwards is
+	// precisely the reflow this design exists to prevent: the live partition
+	// would disagree with the transcript's for the length of the turn.
+	//
+	// What it costs: narration loses a reveal nobody was reading anyway, and THE
+	// ANSWER LOSES ITS TOKEN-BY-TOKEN ARRIVAL -- it lands in one emission once
+	// the model has finished writing it. The only thing that would buy it back
+	// is a provider saying a frame will make no tool call BEFORE its text
+	// arrives, which no OpenAI-compatible stream offers.
+	//
+	// Reasoning is different and still streams, coalesced at 1s: it is already
+	// progress, so it crosses no partition. The interval is coarse because
+	// reasoning IS narration -- picoclaw emits a frame per thought, not per
+	// token, and this channel is consumed as though that were true.
+	var said strings.Builder
 	lastCheckpoint := l.Now()
 
-	// Deltas are COALESCED before they reach the sink, and that is not an
-	// optimisation -- it is the difference between working and not.
-	//
-	// A provider emits sub-word tokens ("Be", "le", "za"). Each one that
-	// reaches the client costs a re-render and, in the webapp, a re-parse of
-	// the whole revealed markdown; its reveal driver additionally re-plans on
-	// every content delta, having been written when "picoclaw sends the whole
-	// answer in one frame, so in practice this runs once per turn". Emitting
-	// per token turned one re-plan into hundreds and the reply visibly
-	// rewrote itself as it arrived.
-	//
-	// 50ms is ~20 updates a second: past what anyone perceives as anything but
-	// smooth, and an order of magnitude fewer renders. Reasoning is coarser
-	// still at 1s, because it is NARRATION -- picoclaw emits a frame per
-	// thought, not per token, and this channel is consumed as though that were
-	// true.
-	content := newCoalescer(50*time.Millisecond, l.Now, func(text string) {
-		emitted = true
-		sink.EmitContent(text)
-	})
 	reasoning := newCoalescer(time.Second, l.Now, func(text string) {
 		sink.EmitProgress(domain.Progress{Kind: domain.ProgressThought, Text: text})
 	})
@@ -682,25 +722,46 @@ func (l *Loop) complete(
 			break
 		}
 		if nerr != nil {
-			// Flush before reporting: whatever arrived is the member's, even
-			// though the turn failed.
-			content.Flush()
+			// Whatever arrived is the member's, even though the turn failed --
+			// and it goes out as CONTENT. A frame that died will run no tool, so
+			// there is no step for it to belong to, and Stream.Message cannot be
+			// asked what it would have been. This is also what keeps `emitted`
+			// true exactly where it was true before the buffering above: the
+			// fallback ladder must not restart a model that has already spoken.
+			if said.Len() > 0 {
+				sink.EmitContent(said.String())
+				emitted = true
+			}
 			reasoning.Flush()
 			err = fmt.Errorf("provider stream: %w", nerr)
 			return domain.Message{}, domain.Usage{}, emitted, err
 		}
-		// FR-2: content reaches the client as the model produces it. The sink
-		// comes FIRST -- D-5: durability must never delay delivery.
-		content.Add(d.Content)
+		said.WriteString(d.Content)
 		reasoning.Add(d.Reasoning)
-		partial.WriteString(d.Content)
 
+		// THE SIDECAR STANDS IN FOR THIS FRAME, not for the turn.
+		//
+		// It used to be seeded with what earlier iterations had said, because
+		// the turn wrote one message at the end and the sidecar had to be able
+		// to replace it. Now each iteration writes its own as it lands, so
+		// seeding would show the member their narration twice after a crash:
+		// once as the step it was written as, once inside the recovered
+		// fragment.
+		//
+		// answersAt is the instant this iteration began, and that is what keeps
+		// the sidecar readable at all. Both readers -- this store's ReadPartial
+		// and crab-shell-proxy's livePartial -- call a sidecar stale once the
+		// transcript holds an assistant message at or after answersAt. Dated by
+		// the member's question, as it was when a turn wrote one message, the
+		// FIRST narration step would supersede every checkpoint after it and a
+		// turn interrupted in its third iteration would recover nothing.
+		//
 		// D-2. On the delta path rather than in a goroutine: an 887us write
 		// every 2s of streaming is 0.04% of that window, so there is nothing
 		// to parallelise and a second writer would need a lock for no gain.
-		if l.Checkpoints != nil && partial.Len() > 0 &&
+		if l.Checkpoints != nil && said.Len() > 0 &&
 			l.Now().Sub(lastCheckpoint) >= l.CheckpointEvery {
-			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionID, answersAt, partial.String()); cerr != nil {
+			if cerr := l.Checkpoints.Checkpoint(ctx, t.SessionID, answersAt, said.String()); cerr != nil {
 				// A failed checkpoint must not fail the turn: it costs recovery
 				// of THIS answer, and failing here would cost the answer itself.
 				sink.EmitProgress(domain.Progress{
@@ -711,24 +772,43 @@ func (l *Loop) complete(
 			lastCheckpoint = l.Now()
 		}
 	}
-	content.Flush()
 	reasoning.Flush()
-	// A tool call is not content, but it IS work the turn has committed to:
-	// re-running it under another model would re-run the tool.
 	msg := stream.Message()
 	if len(msg.ToolCalls) > 0 {
+		// NARRATION. Its text does not enter the content run at all -- Run
+		// emits it as a tool progress frame, and records it as a step. A tool
+		// call is not content, but it IS work the turn has committed to:
+		// re-running it under another model would re-run the tool.
+		return msg, stream.Usage(), true, nil
+	}
+	// THE ANSWER. Emitted from the message rather than from the buffer above so
+	// that what the member sees and what the transcript records are the same
+	// bytes by construction -- an equality the one-message-per-turn design got
+	// for free and this one has to hold across several messages.
+	if msg.Content != "" {
+		sink.EmitContent(msg.Content)
 		emitted = true
 	}
 	return msg, stream.Usage(), emitted, nil
 }
 
 // runTool asks the Approver, then invokes -- or turns a refusal into a Result.
-func (l *Loop) runTool(ctx context.Context, t domain.Turn, call domain.ToolCall, sink domain.Sink) (domain.Result, error) {
+//
+// narration is the text the model wrote in the frame that asked for this call,
+// and this frame is the only place the member sees it while the turn runs.
+func (l *Loop) runTool(
+	ctx context.Context, t domain.Turn, call domain.ToolCall, narration string, sink domain.Sink,
+) (domain.Result, error) {
 	ctx, end := l.span(ctx, "tool.invoke", domain.Attr{Key: "tool.name", Value: call.Name})
 	var err error
 	defer func() { end(err) }()
 
-	sink.EmitProgress(domain.Progress{Kind: domain.ProgressTool, Tool: call.Name})
+	// Shaped exactly like picoclaw's: kind "tool", the agent's own sentence as
+	// the text, the call it narrates as the tool. crab-shell-proxy builds that
+	// frame in internal/pico (progressFor, the tool_calls branch) and the webapp
+	// renders it, so FR-4 is satisfied by using the vocabulary that already
+	// exists rather than by inventing a second shape for the same event.
+	sink.EmitProgress(domain.Progress{Kind: domain.ProgressTool, Text: narration, Tool: call.Name})
 	// The sink, reachable from inside the tool. Only one tool asks for it -- the
 	// dispatcher, which is the only one that can run for minutes -- and it
 	// serialises its own emissions, because Sink is a struct of plain funcs with
