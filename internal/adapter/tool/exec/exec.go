@@ -32,11 +32,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -45,6 +47,14 @@ import (
 const (
 	defaultTimeout = 2 * time.Minute
 	maxOutput      = 64 << 10
+	// waitDelay is how long Wait may go on copying output after the command was
+	// killed, before os/exec closes the pipes under it and returns.
+	//
+	// Short, because by the time it matters the member has already pressed Stop
+	// and every millisecond is one they spend watching a turn they cancelled.
+	// Long enough that a command writing its last line as it dies is not cut off
+	// in the ordinary case, which is the only thing the delay costs.
+	waitDelay = 2 * time.Second
 )
 
 // Tool runs commands with Workdir as the working directory.
@@ -111,6 +121,27 @@ func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, 
 	}
 	cmd := t.command(ctx, shell, a.Command)
 
+	// A PROCESS GROUP, because the thing being killed is `sh -c`, whose whole job
+	// is to start other things.
+	//
+	// CommandContext's own kill signals the shell's pid and nothing else, so its
+	// children outlive it. That is not merely untidy: Stdout and Stderr below are
+	// a bytes.Buffer, which makes os/exec give the command real pipes and copy
+	// them in goroutines -- and Wait does not return until those copies end,
+	// which needs EVERY holder of the write end to be gone. One surviving
+	// grandchild therefore blocks cmd.Run() past the kill, with nothing to break
+	// it. The turn never unwinds, the ingress claim it holds is never released,
+	// and the conversation stays occupied by a turn the member already stopped.
+	//
+	// The negative pid is the group. It is safe here because this process made
+	// the group one line earlier; it is never a pid this harness did not start.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	// And a bound on the wait regardless of whether that worked. Setpgid closes
+	// the case anyone can foresee; this is what makes "the turn ends" not depend
+	// on having foreseen it.
+	cmd.WaitDelay = waitDelay
+
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -119,6 +150,17 @@ func (t *Tool) Invoke(ctx context.Context, raw json.RawMessage) (domain.Result, 
 	out := buf.String()
 	if len(out) > maxOutput {
 		out = out[:maxOutput] + fmt.Sprintf("\n[output truncated at %d bytes]", maxOutput)
+	}
+	// THE MEMBER LEFT, which is not a thing to tell the agent about.
+	//
+	// Reported as an error so the loop stops, and that is the difference from the
+	// deadline below. A deadline is information: the agent wrote a command that
+	// ran too long and should hear so, on the next iteration. A cancellation has
+	// no next iteration -- there is no turn left to inform, and returning a
+	// Result here is what let one continue. It did: the loop read `signal:
+	// killed` as the command's output and asked the model what to do about it.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return domain.Result{}, ctx.Err()
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return domain.Result{Content: out + fmt.Sprintf("\n[the command was still running after %s and was stopped]", timeout)}, nil

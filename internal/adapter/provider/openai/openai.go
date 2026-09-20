@@ -199,7 +199,20 @@ type stream struct {
 	done  bool
 }
 
-func (s *stream) Next(_ context.Context) (domain.Delta, error) {
+// Next honours its context, which it did not: the parameter was discarded and
+// the loop read a bufio.Scanner over the response body.
+//
+// It worked by accident, and the accident had a hole in it. The transport kills
+// the body when the request context dies, so Scan fails and sc.Err() surfaces --
+// USUALLY. A scanner that ends with a nil Err falls through to finish() and
+// returns io.EOF, which is this interface's word for "the model is done": a
+// truncated answer would then be recorded as the complete one. Asking the
+// context first makes the distinction hold by construction rather than by how
+// the connection happened to die.
+func (s *stream) Next(ctx context.Context) (domain.Delta, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Delta{}, err
+	}
 	for s.sc.Scan() {
 		line := strings.TrimSpace(s.sc.Text())
 		// Only data: lines carry payload. event:, id: and comment lines are
@@ -243,6 +256,12 @@ func (s *stream) Next(_ context.Context) (domain.Delta, error) {
 	}
 	if err := s.sc.Err(); err != nil {
 		return domain.Delta{}, fmt.Errorf("read stream: %w", err)
+	}
+	// Asked AGAIN, and this is the half that matters. A body closed under the
+	// scanner can end it with no error of its own, and reporting io.EOF there
+	// would finish a message the model never finished writing.
+	if err := ctx.Err(); err != nil {
+		return domain.Delta{}, err
 	}
 	s.finish()
 	return domain.Delta{}, io.EOF
