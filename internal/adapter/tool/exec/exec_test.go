@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -342,5 +344,59 @@ func TestAProjectShellStartsAtTheProjectRoot(t *testing.T) {
 	// And a turn with no project starts exactly where it always has.
 	if got := tool.projectDir(context.Background()); got != ws {
 		t.Errorf("unscoped cwd = %q, want the workspace %q", got, ws)
+	}
+}
+
+// A stopped turn's command stops, and says so.
+//
+// Both halves matter and only one of them is about speed. The command has to
+// come back -- `sh -c` starts children, and a kill that reaches only the shell
+// leaves one holding the pipes os/exec is still copying, which blocks Wait past
+// the kill with nothing to break it. And it has to come back as an ERROR:
+// reporting a cancellation the way a deadline is reported handed the loop
+// `signal: killed` as the command's output and let the turn continue.
+func TestACancelledCommandEndsAndReportsTheCancellation(t *testing.T) {
+	tool := New(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// A child that outlives its shell, which is the case that used to hang: the
+	// shell exits immediately and the sleep inherits the output pipe.
+	args := json.RawMessage(`{"command":"sleep 120 & sleep 120"}`)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := tool.Invoke(ctx, args)
+		done <- err
+	}()
+
+	// Long enough for the shell to have started both children.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled — the loop would read this as a successful tool call", err)
+		}
+	case <-time.After(waitDelay + 10*time.Second):
+		t.Fatal("the command never returned: Wait is still copying pipes a killed shell's children hold")
+	}
+}
+
+// The deadline is NOT the cancellation, and the difference is what the agent
+// hears. A command that ran too long is information about the command it wrote;
+// it comes back as a Result with no error so the turn can go on and say so.
+func TestATimedOutCommandStillAnswersTheAgent(t *testing.T) {
+	tool := &Tool{Workdir: t.TempDir(), Shell: "/bin/sh", Timeout: 300 * time.Millisecond}
+
+	res, err := tool.Invoke(context.Background(), json.RawMessage(`{"command":"echo before; sleep 30"}`))
+	if err != nil {
+		t.Fatalf("err = %v, want nil: a deadline is the agent's to read, not the turn's to die on", err)
+	}
+	if !strings.Contains(res.Content, "was stopped") {
+		t.Errorf("the result does not say the command was stopped: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "before") {
+		t.Errorf("the output written before the deadline was lost: %q", res.Content)
 	}
 }

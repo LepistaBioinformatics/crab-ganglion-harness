@@ -237,6 +237,23 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	}
 
 	for i := 0; i < c.MaxIterations; i++ {
+		// THE MEMBER PRESSED STOP, and this is where a turn notices between one
+		// piece of work and the next.
+		//
+		// Nothing is emitted. A stop is not a failure -- and the sink it would be
+		// written to is the connection whose closing IS the stop, so the only
+		// reader of that error is a log. What the turn produced up to here is
+		// already durable: every completed iteration was appended as it landed,
+		// and the frame that was in flight is in the checkpoint sidecar.
+		//
+		// The guard is cheap and the alternative is not: without it the next
+		// provider call fails on a dead context and completeWithFallback reads
+		// that as "this model did not answer", walking the whole chain.
+		if err := ctx.Err(); err != nil {
+			runErr = err
+			observe(true)
+			return answer.String(), runErr
+		}
 		// The instant this ITERATION began. It dates the checkpoint sidecar,
 		// which now stands in for one frame rather than for a whole turn -- see
 		// complete, where the supersession rule that depends on it is written
@@ -322,6 +339,19 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				events.Add(domain.TurnEvent{
 					Kind: domain.EventDepth, Name: lvl, Detail: depth.Reason(),
 				})
+			}
+			// A tool that stopped because the TURN was cancelled, told apart
+			// from one that failed. The exec tool reports the member leaving as
+			// ctx.Err() precisely so this branch exists: the events are still
+			// flushed, since a call whose outcome nobody learned is the truth
+			// about an interrupted turn, but nothing is announced as an error.
+			if err != nil && errors.Is(ctx.Err(), context.Canceled) {
+				runErr = err
+				events.Finish(domain.EventFailed, "stopped")
+				c.flushEvents(ctx, t, events, sink)
+				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
+				observe(true)
+				return answer.String(), runErr
 			}
 			if err != nil {
 				runErr = err
@@ -530,6 +560,13 @@ func (l *Loop) tryChain(
 			return msg, usage, nil
 		}
 		lastErr = err
+		// A CANCELLED TURN IS NOT A MODEL THAT DID NOT ANSWER, and walking the
+		// chain on one is how a member who pressed Stop was told their models
+		// were down: every remaining candidate fails instantly on the same dead
+		// context, each announcing itself in a progress frame on the way past.
+		if cerr := ctx.Err(); cerr != nil {
+			return domain.Message{}, domain.Usage{}, cerr
+		}
 		if emitted || i == len(chain)-1 {
 			return domain.Message{}, domain.Usage{}, err
 		}
