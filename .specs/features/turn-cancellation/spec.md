@@ -4,6 +4,17 @@ Pressing Stop in the webapp clears the bands and the agent keeps working. The
 member's next message on that conversation then waits behind a turn they already
 cancelled.
 
+## What was broken first, and is not fixed here
+
+The stop answered **400 "Request path does not match any service"**. Mycelium's
+gateway matches a request against an explicit per-role path list and
+`/v1/chat/cancel` was never in it, so no stop had ever reached crab-shell-proxy,
+under either harness. That is fixed in `zombie-crab-project` — the deployment
+configs, plus a check that fails a PR when a proxy route is not reachable.
+
+Everything below is the SECOND bug, found while the first one hid it: what
+happens once the cancellation does arrive.
+
 ## What was already right
 
 The whole chain exists and is correct up to this harness:
