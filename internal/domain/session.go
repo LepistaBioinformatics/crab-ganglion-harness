@@ -1,5 +1,7 @@
 package domain
 
+import "context"
+
 // SessionKey is the stable per-(user, agent) scope: long-term memory that spans
 // conversations. The proxy derives it and the harness only ever carries it --
 // deriving it here would duplicate a preimage the proxy owns, which is how two
@@ -99,4 +101,27 @@ type Decision struct {
 type Attr struct {
 	Key   string
 	Value string
+}
+
+type conversationKey struct{}
+
+// WithConversation attaches the turn's conversation to a context, for the same
+// reason WithProject does: the reader is a TOOL, whose Invoke takes
+// (ctx, args), and widening that port would make every tool carry a parameter
+// only the conversation-aware ones use.
+//
+// One tool needs it. A tool that searches the conversation's own transcript has
+// to know which conversation it is in, and it is constructed once for the whole
+// process -- there is no per-turn instance to hand the id to.
+func WithConversation(ctx context.Context, id ConversationID) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, conversationKey{}, id)
+}
+
+// ConversationFrom returns the turn's conversation, or "" outside a turn.
+func ConversationFrom(ctx context.Context) ConversationID {
+	id, _ := ctx.Value(conversationKey{}).(ConversationID)
+	return id
 }

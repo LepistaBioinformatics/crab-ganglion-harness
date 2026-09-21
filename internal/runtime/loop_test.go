@@ -137,11 +137,16 @@ func TestRun_CompactionNeverShortensTheTranscript(t *testing.T) {
 	if got != "vou ver. pronto" {
 		t.Errorf("answer = %q, want every iteration's text", got)
 	}
-	// The events entry between them carries no content, so concatenating all
-	// three still reproduces exactly what was streamed -- which is the property
-	// this test is about, and the reason an events entry must never say anything.
-	if len(tr.log) != 4 {
-		t.Errorf("transcript has %d entries, want user + step + events + answer: %+v", len(tr.log), tr.log)
+	// The events entries carry no content, so concatenating all of them still
+	// reproduces exactly what was streamed -- which is the property this test is
+	// about, and the reason an events entry must never say anything.
+	//
+	// The fifth is the COMPACTION MARKER. A budget of one compacts on every
+	// save, and a turn that compacted records that it did: the transcript grows
+	// by the note, which is the opposite of the shortening this test forbids.
+	if len(tr.log) != 5 {
+		t.Errorf("transcript has %d entries, want user + step + events + answer + the compaction marker: %+v",
+			len(tr.log), tr.log)
 	}
 	said := ""
 	for _, m := range tr.log[1:] {

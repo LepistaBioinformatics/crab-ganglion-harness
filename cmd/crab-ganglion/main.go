@@ -27,6 +27,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/skills"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/jsonl"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/tooloutput"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/window"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool"
@@ -34,6 +35,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/exec/landlock"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/imagegen"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/loadimage"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/recall"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/subagents"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/thinking"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/tool/websearch"
@@ -141,8 +143,13 @@ func main() {
 		// only ever sees the narrow interface for each job.
 		Checkpoints: transcript,
 		Context:     windows,
-		Model:       cfg.Model,
-		System:      systemPrompt(cfg, logger),
+		// A tool result is the one thing the loop writes that the transcript
+		// never sees, so the window is its only copy. This gives the large ones
+		// a second -- under the turn's own workspace, where the shell can read
+		// them back once compaction has taken them out of the window.
+		ToolOutput: tooloutput.New(workspace),
+		Model:      cfg.Model,
+		System:     systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{
 			PersonaFile: cfg.SystemFile,
 			Persona:     cfg.System,
@@ -168,7 +175,7 @@ func main() {
 	// runner holds a POINTER, so by the time a child is actually started the
 	// tool set below is in place -- including, at depths under the cap, the
 	// dispatcher itself.
-	builtin := tools(workspace, self, reg, subAgent(loop, reg), logger)
+	builtin := tools(workspace, self, reg, subAgent(loop, reg), transcript, logger)
 	// The memory graph, and anything else an operator mounted over MCP. Placed
 	// AFTER the built-ins so the collision check below has the whole set to
 	// compare against, and CLOSED at shutdown so the server can release the
@@ -370,15 +377,29 @@ func subAgent(loop *runtime.Loop, reg config.Registry) domain.SubAgent {
 		// `research` is a caller of the same dispatcher and would otherwise be
 		// a way around the depth limit.
 		HideAtDepth: []string{subagents.Name, subagents.ResearchName},
+		// A child runs under a fixed SessionID, not the member's conversation,
+		// so search_history would search a transcript every child in this
+		// workspace shares -- answering about this conversation with another
+		// one's text. A child is given a task, not a conversation.
+		HideFromChildren: []string{recall.Name},
 	}
 }
 
-func tools(workspace, self string, reg config.Registry, child domain.SubAgent, logger *log.Logger) []tool.Tool {
+func tools(
+	workspace, self string, reg config.Registry, child domain.SubAgent,
+	transcript domain.TranscriptStore, logger *log.Logger,
+) []tool.Tool {
 	// load_image is unconditional: an image in the workspace is something any
 	// deployment can have, and the tool costs nothing when none is there. What
 	// varies is whether a model can SEE the result, which the vision chain
 	// decides at completion time rather than here.
 	out := []tool.Tool{shellTool(workspace, self), loadimage.New(workspace)}
+	// search_history is unconditional for the same reason load_image is: every
+	// deployment has conversations, and the tool costs nothing on the turns that
+	// never reach back. It is the half of compaction that makes the other half
+	// honest -- the window's summary says messages are missing, and without this
+	// the agent is told about a conversation it cannot read.
+	out = append(out, recall.New(transcript))
 	out = append(out, thinking.New(reg))
 	// WHICH of the three ways depth travels is a property of the registry, and
 	// an operator cannot see it from inside the container. So the boot says it.
