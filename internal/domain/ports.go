@@ -181,6 +181,22 @@ type ContextStore interface {
 	Save(ctx context.Context, id ConversationID, w Window) error
 }
 
+// ToolOutputStore parks a tool result too large to keep in the window, and
+// answers with the path the AGENT can read it back from.
+//
+// A separate port rather than a method on ContextStore because the two have
+// opposite lifetimes: a window is rewritten every turn and is worthless once
+// rebuilt, while a parked result is the only copy of output that was never
+// written to the transcript. Folding them together would put the durable one
+// behind the interface whose whole contract is that rewriting it is safe.
+//
+// The path is relative to the turn's own workspace, which is where a command
+// starts and where the sandbox's root ends. An absolute path would name a
+// location outside the agent's reach the moment either moves.
+type ToolOutputStore interface {
+	Put(ctx context.Context, id ConversationID, callID, content string) (string, error)
+}
+
 // ToolExecutor runs one tool call.
 type ToolExecutor interface {
 	Available(ctx context.Context) []ToolSchema

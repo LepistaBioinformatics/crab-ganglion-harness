@@ -223,3 +223,40 @@ func (c *capturingTools) Invoke(ctx context.Context, call domain.ToolCall) (doma
 	c.onInvoke(ctx)
 	return c.inner.Invoke(ctx, call)
 }
+
+// A CHILD IS GIVEN A TASK, NOT A CONVERSATION. It runs under a fixed SessionID
+// rather than the member's, so a tool keyed on the turn's conversation would
+// read a transcript every child in this workspace shares -- answering a
+// question about this conversation with another one's text.
+//
+// Withheld at EVERY depth, unlike HideAtDepth, which bounds recursion: this is
+// about a tool whose meaning does not survive the crossing at all, so the depth
+// here is well under the cap.
+func TestAChildNeverGetsAToolWithheldFromChildren(t *testing.T) {
+	tools := &fakeTools{schemas: []domain.ToolSchema{
+		{Name: "shell"}, {Name: "search_history"},
+	}}
+	var offered []domain.ToolSchema
+	p := answering("done")
+	p.onComplete = func(c domain.Completion) { offered = c.Tools }
+
+	parent := parentLoop(p, tools)
+	c := &Child{
+		Parent: parent, MaxIterations: 3, MaxDepth: 4,
+		HideFromChildren: []string{"search_history"},
+	}
+
+	c.Run(domain.WithFanout(context.Background(), domain.NewFanout(4)),
+		domain.SubTask{Label: "x", Task: "t"})
+
+	var names []string
+	for _, s := range offered {
+		names = append(names, s.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("the child was offered no tools at all; this test would pass vacuously")
+	}
+	if strings.Join(names, ",") != "shell" {
+		t.Fatalf("the child was offered %v, want shell alone -- search_history would search a transcript it does not own", names)
+	}
+}

@@ -37,7 +37,7 @@ func TestCompact_NeverLeavesAToolWithoutItsCall(t *testing.T) {
 		domain.RoleAssistant, domain.RoleUser, domain.RoleAssistant)
 
 	// A budget that lands the cut squarely between the call and its results.
-	got := compact(w, 5)
+	got, _ := compact(w, 5)
 
 	if strings.HasPrefix(roles(got), "tool") {
 		t.Fatalf("window starts with an orphaned tool: %s", roles(got))
@@ -51,7 +51,7 @@ func TestCompact_NeverLeavesAToolWithoutItsCall(t *testing.T) {
 // missing.
 func TestCompact_CountsTheOrphansItDrops(t *testing.T) {
 	w := win(domain.RoleUser, domain.RoleAssistant, domain.RoleTool, domain.RoleTool, domain.RoleAssistant)
-	got := compact(w, 3)
+	got, _ := compact(w, 3)
 
 	if !strings.Contains(got.Summary, "4 earlier") {
 		t.Errorf("summary = %q; it must count the orphaned tools it also removed", got.Summary)
@@ -64,7 +64,7 @@ func TestCompact_CountsTheOrphansItDrops(t *testing.T) {
 func TestCompact_RepairsAnAlreadyBrokenWindow(t *testing.T) {
 	w := win(domain.RoleTool, domain.RoleAssistant, domain.RoleUser)
 
-	got := compact(w, 100) // under budget: no compaction, repair only
+	got, _ := compact(w, 100) // under budget: no compaction, repair only
 	if roles(got) != "assistant,user" {
 		t.Errorf("roles = %s, want the orphan gone", roles(got))
 	}
@@ -82,7 +82,7 @@ func TestDropOrphanTools_LeavesInteriorToolsAlone(t *testing.T) {
 
 func TestCompact_UnderBudgetKeepsEverything(t *testing.T) {
 	w := win(domain.RoleUser, domain.RoleAssistant)
-	if got := compact(w, 10); len(got.Messages) != 2 || got.Summary != "" {
+	if got, _ := compact(w, 10); len(got.Messages) != 2 || got.Summary != "" {
 		t.Errorf("compacted a window that fits: %+v", got)
 	}
 }

@@ -72,6 +72,18 @@ type Message struct {
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
 	// ToolCallID links a RoleTool message back to the call it answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Offloaded is the workspace-relative path of the file holding this tool
+	// result's WHOLE output, set when the result was too large to carry inline.
+	//
+	// Structural on purpose. Compaction has to tell "this message kept a
+	// pointer" from "this message is short" without reading its text, and a
+	// sentinel prefix in Content would be a parser for a string this package
+	// also writes -- one rewording away from silently eliding nothing.
+	//
+	// It reaches no provider (the wire adapter sends role, content, tool_calls
+	// and tool_call_id) and no transcript (a tool result is never appended to
+	// one), so it exists only between the window on disk and the loop.
+	Offloaded string `json:"offloaded,omitempty"`
 	// Events is what the loop DID during one iteration, written for the member
 	// rather than for the model. A message carrying them carries no content: it
 	// is the iteration's detail, not a second thing the agent said.
@@ -110,6 +122,13 @@ type TurnEvent struct {
 	Status string `json:"status,omitempty"`
 	// Detail is the failure's text, the depth's reason, or the fallback's cause.
 	Detail string `json:"detail,omitempty"`
+	// Count is how many of something the event is about. Set only by
+	// EventCompact, where it is the number of messages compaction dropped.
+	//
+	// A number rather than a sentence because the reader's language is decided
+	// downstream: this harness has no locale, so it writes the count and the
+	// webapp writes "N earlier messages" or "N mensagens anteriores".
+	Count int `json:"count,omitempty"`
 }
 
 // Event kinds and statuses, named so a typo is a compile error.
@@ -118,6 +137,11 @@ const (
 	EventSubagent = "subagent"
 	EventModel    = "model"
 	EventDepth    = "depth"
+	// EventCompact is the context window being shortened. Unlike the four above
+	// it records something the LOOP did to the conversation rather than
+	// something the agent did in it, which is why it carries a Count and no
+	// Name: there is no tool, no child and no model to name.
+	EventCompact = "compact"
 
 	EventOK     = "ok"
 	EventDenied = "denied"

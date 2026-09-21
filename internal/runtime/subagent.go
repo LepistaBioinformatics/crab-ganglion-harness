@@ -40,6 +40,15 @@ type Child struct {
 	MaxDepth int
 	// HideAtDepth names the tools withheld once MaxDepth is reached.
 	HideAtDepth []string
+	// HideFromChildren names the tools withheld from EVERY child, at any depth.
+	//
+	// Different from HideAtDepth, which bounds recursion. This one is about a
+	// tool whose meaning does not survive the crossing: a child runs under a
+	// fixed SessionID rather than the member's conversation, so a tool keyed on
+	// the turn's conversation would read a transcript shared by every child in
+	// the workspace -- answering a question about this conversation with text
+	// from a different one.
+	HideFromChildren []string
 }
 
 // Run executes one child turn.
@@ -75,6 +84,7 @@ func (c *Child) Run(ctx context.Context, task domain.SubTask) domain.SubReport {
 	// turns would make every pattern that used the dispatcher look six times as
 	// common as it is.
 	child.Learner = nil
+	child.Tools = withoutTools(child.Tools, c.HideFromChildren)
 	if fan.Depth() >= c.MaxDepth {
 		child.Tools = withoutTools(child.Tools, c.HideAtDepth)
 	}

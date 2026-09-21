@@ -45,9 +45,12 @@ type Loop struct {
 	// and the turn behaves as it did before D-2.
 	Checkpoints domain.Checkpointer
 	Context     domain.ContextStore
-	Tools       domain.ToolExecutor
-	Approver    domain.Approver
-	Telemetry   domain.Telemetry
+	// ToolOutput may be nil: nothing is parked and a large result stays whole
+	// in the window, which is the behaviour every turn had before this existed.
+	ToolOutput domain.ToolOutputStore
+	Tools      domain.ToolExecutor
+	Approver   domain.Approver
+	Telemetry  domain.Telemetry
 
 	// Model is the single model this harness was configured with, used when
 	// Models is nil.
@@ -147,6 +150,9 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// either would make every implementation carry a parameter only the
 	// project-aware ones use.
 	ctx = domain.WithProject(ctx, t.Project)
+	// And the conversation, for the one tool that reads this conversation's own
+	// transcript. Same reasoning, same port.
+	ctx = domain.WithConversation(ctx, t.SessionID)
 
 	depth := &domain.Depth{}
 	ctx = domain.WithDepth(ctx, depth)
@@ -185,6 +191,9 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	// fail at the provider on every turn forever, because nothing else ever
 	// revisits the front of the window.
 	window = repair(window)
+	// How much THIS turn's compaction dropped, summed across every run of it.
+	// One marker is written from this at whichever exit ends the turn.
+	compacted := 0
 	window.Messages = append(window.Messages, in)
 
 	// What the member sees, accumulated across every iteration of this turn.
@@ -287,7 +296,10 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 
 		if len(msg.ToolCalls) == 0 {
 			c.recordUsage(ctx, total, t)
-			window = compact(window, c.WindowBudget)
+			var n int
+			window, n = compact(window, c.WindowBudget)
+			compacted += n
+			c.markCompaction(ctx, t, compacted, sink)
 			runErr = c.Context.Save(ctx, t.SessionID, window)
 			// AFTER the answer is durable and the member has it. A learner that
 			// ran first would put an analysis pass between the model finishing
@@ -378,15 +390,12 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			for _, e := range res.Events {
 				events.Add(e)
 			}
-			out := domain.Message{
-				Role:       domain.RoleTool,
-				Content:    res.Content,
-				ToolCallID: call.ID,
-				CreatedAt:  c.Now(),
-			}
 			// The tool result goes to the window only. The served transcript
-			// records what the member saw, and they never saw this.
-			window.Messages = append(window.Messages, out)
+			// records what the member saw, and they never saw this -- which is
+			// also why a large one is PARKED on the way in. The window being
+			// its sole copy is what makes compaction dropping it a loss of the
+			// bytes and not merely of the context.
+			window.Messages = append(window.Messages, c.offload(ctx, t, call.ID, res.Content))
 
 			// Media a tool produced follows as a SYNTHETIC USER MESSAGE rather
 			// than riding on the result above.
@@ -420,7 +429,14 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		// has events; without them it would be dropped as empty.
 		c.flushEvents(ctx, t, events, sink)
 
-		window = compact(window, c.WindowBudget)
+		// ACCUMULATED, not written. Compaction runs once per iteration, so a
+		// long turn compacts many times -- and a marker per run would put a
+		// dozen dividers in the member's transcript for one turn's worth of
+		// shortening. The marker is written once, at whichever exit ends the
+		// turn.
+		var dropped int
+		window, dropped = compact(window, c.WindowBudget)
+		compacted += dropped
 		if err := c.Context.Save(ctx, t.SessionID, window); err != nil {
 			runErr = fmt.Errorf("save context: %w", err)
 			return answer.String(), runErr
@@ -436,7 +452,9 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 	observe(true)
 	// Nothing to finish: the last iteration's narration was appended when it
 	// arrived, like every one before it.
-	if saveErr := c.Context.Save(ctx, t.SessionID, compact(window, c.WindowBudget)); saveErr != nil {
+	window, lastDrop := compact(window, c.WindowBudget)
+	c.markCompaction(ctx, t, compacted+lastDrop, sink)
+	if saveErr := c.Context.Save(ctx, t.SessionID, window); saveErr != nil {
 		return answer.String(), saveErr
 	}
 	return answer.String(), nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/domain"
@@ -176,5 +177,49 @@ func TestARebuiltWindowCarriesNoToolCallsAndNoToolResults(t *testing.T) {
 	// The narration text is what was worth keeping.
 	if w.Messages[1].Content != "vou olhar" {
 		t.Errorf("the narration was lost with its call: %+v", w.Messages[1])
+	}
+}
+
+// A rebuilt window used to begin mid-conversation with nothing marking the cut,
+// so the agent read a seed as though it were the whole exchange. That is the
+// same silence compaction is being taught to break, arriving from the other
+// direction: the window is short for a reason and the reason has to be in it.
+func TestARebuiltWindowSaysWhatItLeftBehind(t *testing.T) {
+	tr := &fakeTranscript{msgs: says(10)}
+
+	w, err := store(t, tr, 4).Load(context.Background(), "conv")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if w.Summary == "" {
+		t.Fatal("a rebuilt window that left six messages behind says nothing about them")
+	}
+	if !strings.Contains(w.Summary, "6") {
+		t.Errorf("the summary says %q; it left 6 messages behind", w.Summary)
+	}
+}
+
+// Counted from the rebuild, never read off a compaction marker. A marker
+// records what the LIVE window dropped, against a history this rebuild is not
+// reconstructing -- carrying its number over would state a count that was true
+// of the window this one replaces.
+func TestARebuildIgnoresACompactionMarkersOwnCount(t *testing.T) {
+	msgs := append([]domain.Message{{
+		Role:   domain.RoleAssistant,
+		Events: []domain.TurnEvent{{Kind: domain.EventCompact, Count: 999}},
+	}}, says(3)...)
+	tr := &fakeTranscript{msgs: msgs}
+
+	w, err := store(t, tr, 100).Load(context.Background(), "conv")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if w.Summary != "" {
+		t.Errorf("nothing was left behind, but the window says %q", w.Summary)
+	}
+	if len(w.Messages) != 3 {
+		t.Errorf("seeded %d messages, want the three that were said -- the marker is not one", len(w.Messages))
 	}
 }

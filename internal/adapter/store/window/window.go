@@ -95,10 +95,28 @@ func (s *Store) rebuild(ctx context.Context, id domain.ConversationID) domain.Wi
 	if err != nil || len(msgs) == 0 {
 		return domain.Window{}
 	}
+	left := 0
 	if s.SeedBudget > 0 && len(msgs) > s.SeedBudget {
+		left = len(msgs) - s.SeedBudget
 		msgs = msgs[len(msgs)-s.SeedBudget:]
 	}
-	return domain.Window{Messages: conversational(msgs)}
+	w := domain.Window{Messages: conversational(msgs)}
+	if left > 0 {
+		// SAID, not silently done. A rebuilt window used to begin mid-conversation
+		// with nothing marking the cut, so the agent read a seed as though it were
+		// the whole exchange -- the same silence compaction is being taught to
+		// break, arriving from the other direction.
+		//
+		// Counted HERE rather than read off a compaction marker in the transcript.
+		// A marker records what the LIVE window dropped, against a history this
+		// rebuild is not reconstructing: it seeds a fresh tail and leaves a
+		// different amount behind. Carrying the marker's number over would state a
+		// count that was true of a window this one is replacing.
+		w.Summary = fmt.Sprintf(
+			"[%d earlier messages are not in this window. The full transcript is preserved "+
+				"and is searchable.]", left)
+	}
+	return w
 }
 
 // conversational keeps the part of a transcript a provider will accept, which
