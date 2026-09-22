@@ -115,8 +115,13 @@ capability (`tools()` in `cmd/crab-ganglion/main.go`). Always present: **`shell`
 the tool that matters; **`load_image`**, which reads an image already in the
 workspace, where the webapp's uploads land; and **`set_reasoning_depth`**, which
 lets the model think harder for the rest of a turn — that one always exists, and
-only its routing varies, depending on whether a model declares `thinking_level`.
-Conditional:
+only its routing varies, depending on whether a model declares `thinking_level`;
+and **`search_history`**, which searches what was said earlier in the
+conversation, including the turns compaction has dropped from the window. It does
+not cover tool output — a large result is parked in a file under `.tool-output/`
+and the message that replaced it names the path. It is also hidden from
+sub-agents, which share a session id and would otherwise read a transcript that
+is not theirs. Conditional:
 
 - **`web_search` and `web_fetch`**, together, when a search provider in the
   registry is enabled and carries what it needs (brave, tavily, searxng,
