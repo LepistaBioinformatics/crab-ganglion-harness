@@ -251,6 +251,34 @@ var passThrough = map[string]bool{
 	"TZ":   true,
 }
 
+// SecretPrefix marks a variable the MEMBER put there, and it is the one thing a
+// command sees that the allowlist above does not name.
+//
+// It exists because there was no way for a member's own credential to reach their
+// agent at all. Under picoclaw the secrets a member saved were files in a mounted
+// `.secrets/`; the ganglion has no such bind, and the proxy's comment saying
+// "credentials arrive as environment" was true of the harness PROCESS and false of
+// the shell it hands the agent. A member migrating from picoclaw wrote a secret,
+// got a 200, and their agent could not see it -- with nothing anywhere saying so.
+//
+// IT DOES NOT WEAKEN THE RULE ABOVE, which is the reason it is a prefix rather
+// than a handful of new names. The principle is that the PROXY decides what a
+// command may see, and a denylist here would have to learn every variable the
+// proxy ever adds. A prefix keeps that exactly: the proxy decides what to put
+// under it, and everything outside it -- GANGLION_API_KEY, GANGLION_TOKEN, the
+// approval endpoint, the passphrase -- stays scrubbed with no edit here.
+//
+// TWO UNDERSCORES, so the boundary between the marker and the member's own name
+// is unmistakable: `CRAB_SECRET__DB_URL` is `DB_URL`, and a member whose secret is
+// itself called `SECRET_FOO` cannot be confused for one.
+//
+// WHAT THIS ACCEPTS. A command can now read the member's credential, so an agent
+// steered by untrusted text can exfiltrate it. That is inherent -- a secret the
+// agent cannot use is not a feature -- and it is the member's own credential
+// rather than the deployment's, which is exactly the distinction the allowlist
+// above draws.
+const SecretPrefix = "CRAB_SECRET__"
+
 // scrubEnv keeps only passThrough, and supplies a PATH if the container has
 // none -- a command with no PATH cannot find /bin/ls, which would look like a
 // broken tool rather than a missing variable.
@@ -258,10 +286,21 @@ func scrubEnv(environ []string) []string {
 	out := make([]string, 0, len(passThrough))
 	seen := map[string]bool{}
 	for _, kv := range environ {
-		k, _, ok := strings.Cut(kv, "=")
-		if ok && passThrough[k] {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if passThrough[k] {
 			out = append(out, kv)
 			seen[k] = true
+			continue
+		}
+		// The member's own, under the marker the proxy put there. The marker is
+		// STRIPPED: what the member saved as DB_URL is what a command reads, or
+		// every tool expecting a conventional name would have to be told about
+		// this harness.
+		if name, marked := strings.CutPrefix(k, SecretPrefix); marked && name != "" {
+			out = append(out, name+"="+v)
 		}
 	}
 	if !seen["PATH"] {
