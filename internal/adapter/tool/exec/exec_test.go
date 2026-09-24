@@ -66,6 +66,59 @@ func TestNoConfiguredVariableIsPassedToCommands(t *testing.T) {
 	}
 }
 
+// THE MEMBER'S OWN CREDENTIAL, which had no way through at all.
+//
+// Under picoclaw a member's saved secrets were files in a mounted `.secrets/`.
+// The ganglion has no such bind, and the proxy's "credentials arrive as
+// environment" was true of this PROCESS and false of the shell it hands the
+// agent -- so a member migrating from picoclaw saved a secret, got a 200, and
+// their agent could not see it, with nothing anywhere reporting the gap.
+func TestMarkedSecretsReachTheCommandWithoutTheMarker(t *testing.T) {
+	got := map[string]string{}
+	for _, kv := range scrubEnv([]string{
+		"CRAB_SECRET__DB_URL=postgres://x",
+		"CRAB_SECRET__OPENAI_API_KEY=sk-member",
+		"PATH=/bin",
+	}) {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	// STRIPPED. A tool looking for DB_URL must find DB_URL, or every one of them
+	// would have to be told about this harness.
+	if got["DB_URL"] != "postgres://x" {
+		t.Errorf("the member's DB_URL did not reach the command: %v", got)
+	}
+	if got["OPENAI_API_KEY"] != "sk-member" {
+		t.Errorf("the member's OPENAI_API_KEY did not reach the command: %v", got)
+	}
+	for k := range got {
+		if strings.HasPrefix(k, SecretPrefix) {
+			t.Errorf("%s still wears the marker; a command sees the proxy's plumbing", k)
+		}
+	}
+}
+
+// THE MARKER IS THE WHOLE WIDENING, and this is what says so. Everything the
+// proxy sets without it stays scrubbed, with no edit in this file -- which is the
+// property the allowlist exists for and the reason this is a prefix rather than a
+// handful of new names.
+func TestNothingWithoutTheMarkerGetsThrough(t *testing.T) {
+	out := scrubEnv([]string{
+		"GANGLION_API_KEY=deploy-wide",
+		"GANGLION_TOKEN=bearer",
+		"GANGLION_APPROVAL_ENDPOINT=http://proxy/approve",
+		"CRAB_SECRET=no-name-after-the-marker",
+		"CRAB_SECRET__=empty-name",
+		"PATH=/bin",
+	})
+	for _, kv := range out {
+		k, _, _ := strings.Cut(kv, "=")
+		if k != "PATH" {
+			t.Errorf("%s reached the command; only PATH should have", k)
+		}
+	}
+}
+
 // The allowlist is stated by name here as well as in the code, so widening it
 // is a two-file change someone has to mean.
 func TestAllowlistIsExactlyWhatIsIntended(t *testing.T) {
