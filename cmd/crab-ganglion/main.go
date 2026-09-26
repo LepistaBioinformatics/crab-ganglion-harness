@@ -166,8 +166,8 @@ func main() {
 		// model in the window, so its files can neither be compressed nor kept.
 		// This one is never named to the model, so it can be both.
 		ToolAudit: audit,
-		Model:      cfg.Model,
-		System:     systemPrompt(cfg, logger),
+		Model:     cfg.Model,
+		System:    systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{
 			PersonaFile: cfg.SystemFile,
 			Persona:     cfg.System,

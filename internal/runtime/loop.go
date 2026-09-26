@@ -53,8 +53,8 @@ type Loop struct {
 	// this existed says.
 	ToolAudit domain.ToolAuditStore
 	Tools     domain.ToolExecutor
-	Approver   domain.Approver
-	Telemetry  domain.Telemetry
+	Approver  domain.Approver
+	Telemetry domain.Telemetry
 
 	// Model is the single model this harness was configured with, used when
 	// Models is nil.
