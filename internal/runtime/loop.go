@@ -48,7 +48,11 @@ type Loop struct {
 	// ToolOutput may be nil: nothing is parked and a large result stays whole
 	// in the window, which is the behaviour every turn had before this existed.
 	ToolOutput domain.ToolOutputStore
-	Tools      domain.ToolExecutor
+	// ToolAudit may be nil: no record is kept and the member's sheet says the
+	// call was not recorded, which is also what every transcript written before
+	// this existed says.
+	ToolAudit domain.ToolAuditStore
+	Tools     domain.ToolExecutor
 	Approver   domain.Approver
 	Telemetry  domain.Telemetry
 
@@ -322,7 +326,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		// heals the conversations this already cost.
 		var media []domain.Message
 
-		for _, call := range msg.ToolCalls {
+		for callIdx, call := range msg.ToolCalls {
 			chosen := depth.Level()
 			// msg.Content is this iteration's NARRATION, and runTool is where it
 			// reaches the member: it rides on the tool frame rather than on a
@@ -333,8 +337,15 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			// says which one it was in. Its status is filled in below; an event
 			// with none is a call whose outcome nobody ever learned, which is
 			// the truth about an interrupted turn.
+			//
+			// The audit record is written HERE, beside the event and for the same
+			// reason: it carries the WHOLE command, where the event carries 200
+			// runes of it, and a record written only after the call returned
+			// would be missing on exactly the turn that died inside one.
+			auditID := mintAuditID(c.Now(), callIdx)
 			events.Add(domain.TurnEvent{
 				Kind: domain.EventTool, Name: call.Name, Arguments: eventArgs(call.Args),
+				AuditID: c.putAudit(ctx, t, auditID, call),
 			})
 			res, err := c.runTool(ctx, t, call, msg.Content, sink)
 			// Said out loud when it changes. A turn that suddenly takes four
@@ -360,6 +371,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			if err != nil && errors.Is(ctx.Err(), context.Canceled) {
 				runErr = err
 				events.Finish(domain.EventFailed, "stopped")
+				c.completeAudit(ctx, t, auditID, "", domain.EventFailed, "stopped")
 				c.flushEvents(ctx, t, events, sink)
 				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
 				observe(true)
@@ -369,6 +381,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				runErr = err
 				sink.EmitError(err.Error())
 				events.Finish(domain.EventFailed, err.Error())
+				c.completeAudit(ctx, t, auditID, "", domain.EventFailed, err.Error())
 				// The narration that led to this call was appended before the
 				// call ran, so there is no message to write here -- but the
 				// events are the one thing this path would otherwise lose, and
@@ -381,8 +394,13 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 			outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Denied: res.Denied})
 			if res.Denied {
 				events.Finish(domain.EventDenied, "")
+				c.completeAudit(ctx, t, auditID, res.Content, domain.EventDenied, "")
 			} else {
 				events.Finish(domain.EventOK, "")
+				// The FULL result, not the clamped copy the window gets below. A
+				// member opening the sheet is asking for what the offload took
+				// away.
+				c.completeAudit(ctx, t, auditID, res.Content, domain.EventOK, "")
 			}
 			// Whatever the tool did that this loop cannot see. Appended AFTER
 			// the call's own event, so a dispatcher's children read as belonging
@@ -1059,3 +1077,49 @@ func eventArgs(raw []byte) string {
 // enough for a URL, a path, or a short command -- which is what makes a step
 // verifiable -- and far short of a file's contents.
 const maxEventArgs = 200
+
+// mintAuditID names a tool call's record, uniquely within a conversation.
+//
+// THE HARNESS MINTS IT, rather than using the provider's call id, because that
+// id MAY BE EMPTY: the OpenAI adapter assigns ToolCall.ID only when the stream
+// carried one (`openai.go`, absorbToolCalls) and has no fallback. A store keyed
+// on it would put every idless call in a conversation into one file -- silently,
+// because `safe("")` is a valid filename.
+//
+// Nanoseconds plus the call's index within its iteration. Unique without
+// consulting anything (two calls in one iteration differ by index; two
+// iterations differ by clock), sorts chronologically, and is already within
+// [a-z0-9_-] so no store has to reshape it.
+func mintAuditID(now time.Time, callIdx int) string {
+	return fmt.Sprintf("%d-%02d", now.UnixNano(), callIdx)
+}
+
+// putAudit records the command and returns the id to put on the event, or ""
+// when there is no store or the write failed.
+//
+// THE RETURN IS THE POINTER, so an event only ever names a record that was
+// actually written. A turn whose disk is full keeps working and its rows simply
+// do not open, which is the same degradation as a transcript written before any
+// of this existed.
+//
+// Failure is never an error here, for the reason the offload gives: this moves
+// bytes, it does not change what the agent is told, so a turn that works today
+// cannot start failing because this did.
+func (l *Loop) putAudit(ctx context.Context, t domain.Turn, auditID string, call domain.ToolCall) string {
+	if l.ToolAudit == nil {
+		return ""
+	}
+	if err := l.ToolAudit.Put(ctx, t.SessionID, auditID, call.Name, string(call.Args)); err != nil {
+		return ""
+	}
+	return auditID
+}
+
+// completeAudit fills in what the call returned. Silent on every failure,
+// including a record that was never written.
+func (l *Loop) completeAudit(ctx context.Context, t domain.Turn, auditID, output, status, detail string) {
+	if l.ToolAudit == nil || auditID == "" {
+		return
+	}
+	_ = l.ToolAudit.Complete(ctx, t.SessionID, auditID, output, status, detail)
+}

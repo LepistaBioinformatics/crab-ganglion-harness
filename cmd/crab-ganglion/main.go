@@ -27,6 +27,7 @@ import (
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/provider/router"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/skills"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/jsonl"
+	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/toolaudit"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/tooloutput"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/store/window"
 	"github.com/LepistaBioinformatics/crab-ganglion-harness/internal/adapter/telemetry/otlp"
@@ -134,6 +135,18 @@ func main() {
 	// just begun.
 	windows.Transcript = transcript
 	windows.SeedBudget = runtime.DefaultWindowBudget
+	// SWEPT AT BOOT, which in this harness is frequent rather than rare:
+	// containers scale to zero, so a boot is the ordinary event in a
+	// conversation's life. A timer would be a second thing to schedule, stop and
+	// test for the same effect.
+	//
+	// Projects included. Their records live under sibling `workspace-<id>`
+	// directories and ONE process serves all of them, so Sweep walks the
+	// siblings itself -- nothing else would ever reach them.
+	audit := toolaudit.New(workspace)
+	if n := audit.Sweep(workspace); n > 0 {
+		logger.Printf("compressed %d tool-call records older than %s", n, toolaudit.CompressAfter)
+	}
 	loop := &runtime.Loop{
 		Provider:   models,
 		Models:     models,
@@ -148,6 +161,11 @@ func main() {
 		// a second -- under the turn's own workspace, where the shell can read
 		// them back once compaction has taken them out of the window.
 		ToolOutput: tooloutput.New(workspace),
+		// The durable half, and a SECOND store rather than a wider contract on
+		// the one above: that directory is the agent's scratch, named to the
+		// model in the window, so its files can neither be compressed nor kept.
+		// This one is never named to the model, so it can be both.
+		ToolAudit: audit,
 		Model:      cfg.Model,
 		System:     systemPrompt(cfg, logger),
 		Prompt: &skills.Prompt{

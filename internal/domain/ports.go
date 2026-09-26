@@ -197,6 +197,40 @@ type ToolOutputStore interface {
 	Put(ctx context.Context, id ConversationID, callID, content string) (string, error)
 }
 
+// ToolAuditStore keeps a durable record of every tool call: the full command,
+// and the output it produced.
+//
+// A SECOND STORE BESIDE ToolOutputStore, not an extension of it, and the split
+// is the whole design. That one is the AGENT's scratch -- the path it returns is
+// handed to the model inside the window, and `elide` leaves that path there
+// after compaction -- which fixes two policies onto it that an audit record
+// must not have. Its files cannot be renamed, because a resumed conversation
+// may still hold a pointer at one, so they cannot be compressed; and it deletes
+// past Retain, which is exactly what an audit must not do. A record here is
+// never named to the model, so it can be compressed freely and is never
+// removed.
+//
+// The duplicate bytes for a result over 8 KiB are the cost, and they buy two
+// directories that answer two questions rather than one that answers neither
+// well.
+//
+// NOT TAMPER-EVIDENT, and worth stating at the port. This is written inside the
+// container, under the agent's own bind, and the ganglion's one tool is
+// `/bin/sh -c` with no path restriction. A turn steered by untrusted text can
+// rewrite it. That makes it exactly as trustworthy as the transcript in
+// `sessions/` beside it, which is already what the member reads -- no more, and
+// no less. Moving the record outside the sandbox means streaming it to the
+// proxy, which is additive later rather than a change to this.
+type ToolAuditStore interface {
+	// Put records a call that is about to run: its name and full arguments.
+	// Called BEFORE the tool executes, so a turn that dies inside one still
+	// leaves evidence of what it was doing.
+	Put(ctx context.Context, id ConversationID, auditID, name, arguments string) error
+	// Complete rewrites the record with what the call returned. A Complete for a
+	// record that was never Put is a no-op rather than a partial record.
+	Complete(ctx context.Context, id ConversationID, auditID, output, status, detail string) error
+}
+
 // ToolExecutor runs one tool call.
 type ToolExecutor interface {
 	Available(ctx context.Context) []ToolSchema

@@ -122,6 +122,20 @@ type TurnEvent struct {
 	Status string `json:"status,omitempty"`
 	// Detail is the failure's text, the depth's reason, or the fallback's cause.
 	Detail string `json:"detail,omitempty"`
+	// AuditID names this call's record under .tool-audit, and is how the member's
+	// client asks for the full command and the output.
+	//
+	// MINTED HERE, not the provider's call id, which may be empty: the OpenAI
+	// adapter assigns ToolCall.ID only when the stream carried one and has no
+	// fallback, so keying a file on it would collapse every idless call in a
+	// conversation into one record, silently.
+	//
+	// `omitempty` is load-bearing twice over. Every transcript written before
+	// this field existed has no record to name, and every event that is not a
+	// tool call has none either -- a model fallback and a depth change have no
+	// command and no output, so a client must be able to tell "nothing to open"
+	// from "empty".
+	AuditID string `json:"audit_id,omitempty"`
 	// Count is how many of something the event is about. Set only by
 	// EventCompact, where it is the number of messages compaction dropped.
 	//

@@ -80,6 +80,21 @@ func (c *Child) Run(ctx context.Context, task domain.SubTask) domain.SubReport {
 	// A checkpoint is a sidecar for an answer a member is watching arrive.
 	// Nobody is watching this one.
 	child.Checkpoints = nil
+	// NOR A TOOL-CALL RECORD, for the reason the transcript is in memory. A
+	// child runs under SessionID "subagent", which is not a conversation: left
+	// on, every child of every conversation in this container would write into
+	// one `.tool-audit/subagent/` directory, naming a conversation no member
+	// ever had. Nothing could ever reach those records -- the route composes its
+	// path from the member's own session key -- so they would be bytes that only
+	// grow.
+	//
+	// The child's work is not lost by this. Its finding is already durable
+	// inside the parent's tool result, and the DISPATCH is itself a tool call
+	// with a record of its own: the tasks that went out and the answers that
+	// came back are both in it. What is given up is each child's internal steps,
+	// which would need the child's events to carry ids the parent's transcript
+	// could name.
+	child.ToolAudit = nil
 	// Evolution observes MEMBER turns. Counting a fan-out's six children as six
 	// turns would make every pattern that used the dispatcher look six times as
 	// common as it is.
