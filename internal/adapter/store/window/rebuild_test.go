@@ -223,3 +223,28 @@ func TestARebuildIgnoresACompactionMarkersOwnCount(t *testing.T) {
 		t.Errorf("seeded %d messages, want the three that were said -- the marker is not one", len(w.Messages))
 	}
 }
+
+// AN APPROVAL RECORD IS NOT SOMETHING THE AGENT SAID. It is written for the
+// member -- what they were asked and what they answered -- in the one shape
+// this rebuild drops whole: no content, carrying events. Seeded into a window
+// it would be an assistant message saying nothing, which some providers reject
+// and none can use, and the model already knows the outcome: an allowed call
+// put its result in the window, and a refused one put the refusal there.
+func TestARebuildLeavesAnApprovalRecordOutOfTheWindow(t *testing.T) {
+	msgs := append([]domain.Message{{
+		Role: domain.RoleAssistant,
+		Events: []domain.TurnEvent{{
+			Kind: domain.EventApproval, Name: "schedule_create", Status: domain.EventOK,
+		}},
+	}}, says(3)...)
+	tr := &fakeTranscript{msgs: msgs}
+
+	w, err := store(t, tr, 100).Load(context.Background(), "conv")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(w.Messages) != 3 {
+		t.Errorf("seeded %d messages, want the three that were said -- the record is not one", len(w.Messages))
+	}
+}

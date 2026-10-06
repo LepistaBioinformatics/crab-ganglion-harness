@@ -156,10 +156,23 @@ const (
 	// something the agent did in it, which is why it carries a Count and no
 	// Name: there is no tool, no child and no model to name.
 	EventCompact = "compact"
+	// EventApproval is a member being asked whether a tool call may run, and
+	// what they answered. Like EventCompact it is not work the agent did: it is
+	// a decision a PERSON made inside the conversation, and it is the only
+	// event here whose subject is the member.
+	//
+	// Written only when a request actually reached an approver -- see
+	// Decision.Gate. A product with an empty gate list writes none of these.
+	EventApproval = "approval"
 
 	EventOK     = "ok"
 	EventDenied = "denied"
 	EventFailed = "failed"
+	// EventExpired is EventApproval's fourth outcome: the deadline passed with
+	// nobody answering. Told apart from EventDenied because the member did not
+	// refuse -- they were not there -- and from EventFailed because nothing
+	// broke. The call was refused all the same (DEC-4, fail closed).
+	EventExpired = "expired"
 )
 
 // ToolCall is one requested invocation.

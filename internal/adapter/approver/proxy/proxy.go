@@ -39,6 +39,10 @@ func New(endpoint, token string, gated []string, hc *http.Client) *Client {
 
 func (c *Client) Request(ctx context.Context, a domain.ActionRequest) (domain.Decision, error) {
 	if !c.Gated[a.Call.Name] {
+		// NO Gate. Nobody was asked, so there is nothing for the member to read
+		// about later -- see Decision.Gate. Every return below this point is a
+		// call that WAS put to a person, which is why the two failure branches
+		// in Loop.approve may mark themselves gated without re-checking.
 		return domain.Decision{Allowed: true, Reason: "not gated"}, nil
 	}
 	body, err := json.Marshal(wireRequest{
@@ -72,7 +76,20 @@ func (c *Client) Request(ctx context.Context, a domain.ActionRequest) (domain.De
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return domain.Decision{}, fmt.Errorf("decode decision: %w", err)
 	}
-	return domain.Decision{Allowed: out.Allowed, Reason: out.Reason, By: out.By}, nil
+	return domain.Decision{
+		Allowed: out.Allowed, Reason: out.Reason, By: out.By, Gate: gateOf(out.Allowed),
+	}, nil
+}
+
+// gateOf is the answered request's outcome, in the event vocabulary the member's
+// client renders. The two failures -- no answer in time, approver unreachable --
+// are not decidable here: the first never returns from this function at all, and
+// the second is an error rather than a Decision.
+func gateOf(allowed bool) string {
+	if allowed {
+		return domain.EventOK
+	}
+	return domain.EventDenied
 }
 
 type wireRequest struct {

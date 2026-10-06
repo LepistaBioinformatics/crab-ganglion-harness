@@ -325,6 +325,10 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		// conversation replays it and fails identically. See repairToolRuns, which
 		// heals the conversations this already cost.
 		var media []domain.Message
+		// What a member was asked, and answered, during this iteration. Held
+		// rather than written as each decision lands -- see markApprovals for
+		// the ordering that forces.
+		var approvals []domain.TurnEvent
 
 		for callIdx, call := range msg.ToolCalls {
 			chosen := depth.Level()
@@ -347,7 +351,13 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				Kind: domain.EventTool, Name: call.Name, Arguments: eventArgs(call.Args),
 				AuditID: c.putAudit(ctx, t, auditID, call),
 			})
-			res, err := c.runTool(ctx, t, call, msg.Content, sink)
+			res, dec, err := c.runTool(ctx, t, call, msg.Content, sink)
+			// BEFORE the error branches below, both of which return. A turn
+			// that was cancelled inside an approved tool still records the
+			// approval that let it start.
+			if ev, ok := approvalEvent(call, dec); ok {
+				approvals = append(approvals, ev)
+			}
 			// Said out loud when it changes. A turn that suddenly takes four
 			// times as long, and costs four times as much, is owed a sentence
 			// saying the agent decided the question was hard -- and the reason
@@ -373,6 +383,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				events.Finish(domain.EventFailed, "stopped")
 				c.completeAudit(ctx, t, auditID, "", domain.EventFailed, "stopped")
 				c.flushEvents(ctx, t, events, sink)
+				c.markApprovals(ctx, t, approvals, sink)
 				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
 				observe(true)
 				return answer.String(), runErr
@@ -387,6 +398,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 				// events are the one thing this path would otherwise lose, and
 				// a failed call is exactly what a member wants to see.
 				c.flushEvents(ctx, t, events, sink)
+				c.markApprovals(ctx, t, approvals, sink)
 				outcomes = append(outcomes, domain.ToolOutcome{Name: call.Name, Failed: true})
 				observe(true)
 				return answer.String(), runErr
@@ -446,6 +458,7 @@ func (l *Loop) Run(ctx context.Context, t domain.Turn, sink domain.Sink) (string
 		// the agent said. The proxy keeps an entry like that precisely because it
 		// has events; without them it would be dropped as empty.
 		c.flushEvents(ctx, t, events, sink)
+		c.markApprovals(ctx, t, approvals, sink)
 
 		// ACCUMULATED, not written. Compaction runs once per iteration, so a
 		// long turn compacts many times -- and a marker per run would put a
@@ -917,9 +930,14 @@ func (l *Loop) complete(
 //
 // narration is the text the model wrote in the frame that asked for this call,
 // and this frame is the only place the member sees it while the turn runs.
+//
+// The DECISION comes back beside the result, so the caller can record what the
+// member answered. It is not recorded here: an entry written at this point sits
+// between the narration and the iteration's events, which breaks the merge that
+// makes one iteration one step on screen. See markApprovals.
 func (l *Loop) runTool(
 	ctx context.Context, t domain.Turn, call domain.ToolCall, narration string, sink domain.Sink,
-) (domain.Result, error) {
+) (domain.Result, domain.Decision, error) {
 	ctx, end := l.span(ctx, "tool.invoke", domain.Attr{Key: "tool.name", Value: call.Name})
 	var err error
 	defer func() { end(err) }()
@@ -939,17 +957,29 @@ func (l *Loop) runTool(
 	dec := l.approve(ctx, t, call, sink)
 	if !dec.Allowed {
 		// DEC-2: a denial is a Result the agent can react to, not a turn failure.
-		return domain.Result{
-			Denied:  true,
-			Content: fmt.Sprintf("The action %q was not approved: %s", call.Name, dec.Reason),
-		}, nil
+		return domain.Result{Denied: true, Content: refusalText(call.Name, dec.Reason)}, dec, nil
 	}
 
 	res, err := l.Tools.Invoke(ctx, call)
 	if err != nil {
-		return domain.Result{}, fmt.Errorf("tool %s: %w", call.Name, err)
+		return domain.Result{}, dec, fmt.Errorf("tool %s: %w", call.Name, err)
 	}
-	return res, nil
+	return res, dec, nil
+}
+
+// refusalText is what the MODEL is told about a refusal.
+//
+// Two sentences rather than one with an empty tail, because a reason is now
+// genuinely optional: the proxy used to substitute "refused by the member" when
+// a member refused without typing anything, and that substitution was dropped so
+// an English sentence could not end up quoted as the member's own words in a
+// transcript they read in Portuguese. The model loses nothing -- "was not
+// approved" said what the removed clause said.
+func refusalText(tool, reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Sprintf("The action %q was not approved.", tool)
+	}
+	return fmt.Sprintf("The action %q was not approved: %s", tool, reason)
 }
 
 // approve runs the Approver with a deadline, emitting progress while it waits.
@@ -982,7 +1012,23 @@ func (l *Loop) approve(ctx context.Context, t domain.Turn, call domain.ToolCall,
 		select {
 		case a := <-ch:
 			if a.err != nil {
-				return domain.Decision{Allowed: false, Reason: "approval failed: " + a.err.Error()}
+				// GATED, without asking the adapter again: Client.Request
+				// returns before it builds a body when a tool is not gated, so
+				// every error it can produce comes from a request that was
+				// actually sent.
+				//
+				// THE DEADLINE ARRIVES THIS WAY MORE OFTEN THAN AS ctx.Done
+				// BELOW. Both become ready at the same instant and the select
+				// picks one at random -- but a request in flight when the
+				// deadline passes fails with the transport's own error, so this
+				// branch is usually the one that runs. Classifying it from the
+				// context rather than from the error is what keeps "nobody
+				// answered" out of "the approver is broken".
+				return domain.Decision{
+					Allowed: false,
+					Reason:  "approval failed: " + a.err.Error(),
+					Gate:    gateForWait(ctx, domain.EventFailed),
+				}
 			}
 			return a.dec
 		case <-tick.C:
@@ -992,8 +1038,34 @@ func (l *Loop) approve(ctx context.Context, t domain.Turn, call domain.ToolCall,
 				Tool: call.Name,
 			})
 		case <-ctx.Done():
-			return domain.Decision{Allowed: false, Reason: "no answer from an approver in time"}
+			// Expired, not refused: nobody said no, nobody was there. The call
+			// is denied all the same (DEC-4), and the member reads which of the
+			// two happened from the Gate.
+			return domain.Decision{
+				Allowed: false,
+				Reason:  "no answer from an approver in time",
+				Gate:    gateForWait(ctx, domain.EventExpired),
+			}
 		}
+	}
+}
+
+// gateForWait classifies a wait that produced no decision, for the record the
+// member reads.
+//
+// THE MEMBER PRESSING STOP IS NOT AN APPROVAL EVENT, which is why cancellation
+// returns the empty gate and writes no row. Nobody was asked to decide anything
+// and nobody failed to: the turn they were being asked about is the thing that
+// ended. A row saying "permission could not be checked" on a turn the member
+// themselves stopped would be a line of blame for their own click.
+func gateForWait(ctx context.Context, otherwise string) string {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return domain.EventExpired
+	case ctx.Err() != nil:
+		return ""
+	default:
+		return otherwise
 	}
 }
 
@@ -1044,6 +1116,75 @@ func (l *Loop) flushEvents(
 			Kind: domain.ProgressPlaceholder,
 			Text: "could not record this step's events: " + err.Error(),
 		})
+	}
+}
+
+// approvalEvent is one decision a member was asked for, as the transcript
+// records it -- or nothing, when nobody was asked.
+//
+// THE GATE IS THE WHOLE TEST. An ungated call comes back Allowed with no Gate
+// (approver/proxy, Client.Request), and so does the no-op approver a harness
+// with no endpoint configured runs on. Recording those would put a divider
+// under every tool call in a product whose gate list is empty, which is every
+// product today.
+//
+// DETAIL IS THE MEMBER'S OWN WORDS AND NOTHING ELSE. The reasons this harness
+// composes for the other two outcomes -- "no answer from an approver in time",
+// "approval failed: ..." -- are written for the MODEL, in English, and this
+// harness has no locale: every word the member reads is rendered by their
+// client from the status. An English sentence copied here would be the one
+// thing on that row their client could not translate.
+func approvalEvent(call domain.ToolCall, dec domain.Decision) (domain.TurnEvent, bool) {
+	if dec.Gate == "" {
+		return domain.TurnEvent{}, false
+	}
+	ev := domain.TurnEvent{
+		Kind:      domain.EventApproval,
+		Name:      call.Name,
+		Arguments: eventArgs(call.Args),
+		Status:    dec.Gate,
+	}
+	if dec.Gate == domain.EventDenied {
+		ev.Detail = dec.Reason
+	}
+	return ev, true
+}
+
+// markApprovals writes this iteration's decisions into the transcript, one
+// entry each.
+//
+// THE SHAPE IS markCompaction'S, for the reasons written there: an assistant
+// entry with no content and events is invisible to the model, because
+// window.conversational drops exactly that shape when it rebuilds a window from
+// the transcript. A marker with content would be replayed as something the
+// agent said.
+//
+// THE POSITION IS NOT COSMETIC. Called after flushEvents, never beside the
+// decision itself. The client merges an iteration's events-only entry into the
+// narration before it, and an entry wedged between the two breaks that merge:
+// one iteration would render as a step, a divider, and a second step whose
+// narration is gone. After the flush, the divider follows the step it gated.
+//
+// ONE ENTRY PER DECISION rather than one carrying several, so two gated calls
+// in one iteration are two rows a member can read separately -- they were two
+// separate questions.
+//
+// Nothing here fails a turn, the rule markCompaction follows: these are a record
+// for the member, and the work they describe has already happened.
+func (l *Loop) markApprovals(
+	ctx context.Context, t domain.Turn, events []domain.TurnEvent, sink domain.Sink,
+) {
+	for _, ev := range events {
+		if err := l.Transcript.Append(ctx, t.SessionID, domain.Message{
+			Role:      domain.RoleAssistant,
+			Events:    []domain.TurnEvent{ev},
+			CreatedAt: l.Now(),
+		}); err != nil {
+			sink.EmitProgress(domain.Progress{
+				Kind: domain.ProgressPlaceholder,
+				Text: "could not record this approval: " + err.Error(),
+			})
+		}
 	}
 }
 

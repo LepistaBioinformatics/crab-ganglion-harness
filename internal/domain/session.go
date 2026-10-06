@@ -94,6 +94,17 @@ type Decision struct {
 	// By identifies the approver, for the audit trail. The harness never
 	// interprets it -- resolving identity is the proxy's job (DEC-1).
 	By string
+	// Gate is how this decision came about, as one of the EventApproval
+	// statuses: EventOK, EventDenied, EventExpired or EventFailed.
+	//
+	// EMPTY MEANS NOBODY WAS ASKED, and that is the distinction the field
+	// exists for. An ungated call and a real allow both come back
+	// `Allowed: true`, so a transcript record keyed off Allowed alone would put
+	// a divider under every tool call in the product. Only the adapter knows
+	// which tools are gated, so only the adapter -- and the two failure
+	// branches in Loop.approve, which are reachable only after it decided the
+	// call was gated -- may set this.
+	Gate string
 }
 
 // Attr is one telemetry attribute. Modelled as a pair rather than as OTel's own
